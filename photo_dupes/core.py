@@ -30,7 +30,8 @@ Image.MAX_IMAGE_PIXELS = None
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif"}
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".3gp", ".wmv"}
 EXTS = IMAGE_EXTS | VIDEO_EXTS
-VIDEO_FRAMES = 5  # frames taken from every video, evenly spread over its length
+# frames taken from a video, evenly spread over its length: one per 5 s, but 8..32
+VIDEO_FRAMES_MIN, VIDEO_FRAMES_MAX, VIDEO_SEC_PER_FRAME = 8, 32, 5
 DUP_DIR_NAME = "Дубли"
 CACHE_NAME = ".photo_dupes_cache.npz"
 CACHE_VERSION = 2
@@ -85,7 +86,7 @@ def is_video(p: Path) -> bool:
     return p.suffix.lower() in VIDEO_EXTS
 
 
-def video_frames(p: Path, n: int) -> tuple[list[Image.Image], int, int]:
+def video_frames(p: Path, n: int | None = None) -> tuple[list[Image.Image], int, int]:
     """n frames spread over the video (skipping the very start/end, often black), and its size."""
     import cv2  # imported lazily: only needed when the folder has videos
 
@@ -95,6 +96,9 @@ def video_frames(p: Path, n: int) -> tuple[list[Image.Image], int, int]:
             raise ValueError("cannot open video")
         w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if n is None:  # more frames for longer videos, so a short trimmed copy still overlaps enough
+            fps = cap.get(cv2.CAP_PROP_FPS) or 25
+            n = int(min(VIDEO_FRAMES_MAX, max(VIDEO_FRAMES_MIN, count / fps / VIDEO_SEC_PER_FRAME)))
         positions = [int(count * (i + 1) / (n + 1)) for i in range(n)] if count > n else [None]
         frames = []
         for pos in positions:
@@ -143,9 +147,9 @@ def _to_input(im: Image.Image) -> np.ndarray:
 
 
 def preprocess(p: Path):
-    """Model input for a file: (3, H, W) for an image, (VIDEO_FRAMES, 3, H, W) for a video."""
+    """Model input for a file: (3, H, W) for an image, (frames, 3, H, W) for a video."""
     if is_video(p):
-        frames, w, h = video_frames(p, VIDEO_FRAMES)
+        frames, w, h = video_frames(p)
         return np.stack([_to_input(f) for f in frames]), w, h
     with Image.open(p) as im:
         w, h = im.size
