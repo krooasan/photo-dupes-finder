@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv*/
+venv/
+env/
+
+# PyInstaller
+build/
+dist/
+*.spec
+build.log
+
+# model is too big for git, get it with tools/export_onnx.py
+models/*.onnx
+models/*.pt
+
+# files the app writes next to your photos
+.photo_dupes_cache.npz
+*.tmp.npz
+dupes_report_*.csv
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store

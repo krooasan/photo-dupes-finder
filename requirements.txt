@@ -1,0 +1,6 @@
+onnxruntime-directml>=1.18
+numpy>=1.26
+pillow>=10.0
+pillow-heif>=0.16
+send2trash>=1.8
+customtkinter>=5.2
