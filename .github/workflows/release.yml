@@ -1,0 +1,33 @@
+# Push a tag like v1.0.0 -> builds the Windows app and attaches the zip to a GitHub Release.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Convert SSCD to ONNX
+        run: |
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install onnx onnxruntime
+          python tools/export_onnx.py
+      - name: Build
+        shell: cmd
+        run: |
+          python -m venv .venv-build
+          build.bat
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist/PhotoDupesFinder-win64.zip
