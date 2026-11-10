@@ -53,6 +53,7 @@ I_FOLDER, I_SEARCH, I_STOP, I_CLOSE = "\uE838", "\uE721", "\uE71A", "\uE711"
 I_PREV, I_NEXT, I_TRASH, I_MOVE = "\uE76B", "\uE76C", "\uE74D", "\uE8DE"
 I_UNDO, I_PHOTO, I_CHECK, I_INFO = "\uE7A7", "\uE91B", "\uE73E", "\uE946"
 I_STAR, I_LANG, I_EDIT, I_PLAY, I_VIDEO = "\uE734", "\uE774", "\uE70F", "\uE768", "\uE714"
+I_DROP = "\uE896"  # download arrow: "drop here"
 
 _fonts_ok = False
 
@@ -568,6 +569,10 @@ class App(ctk.CTk):
         card = self.folder_card = ctk.CTkFrame(sb, fg_color=TILE, corner_radius=10, border_width=1,
                                                border_color=BORDER, height=68, cursor="hand2")
         card.pack(**pad)
+        drop = ctk.CTkFrame(sb, fg_color="transparent")
+        drop.pack(pady=(8, 0), **pad)
+        ctk.CTkLabel(drop, text="", image=icon(I_DROP, MUTED, 14)).pack(side="left")
+        label(drop, t("drop_short"), T_SMALL, MUTED, anchor="w").pack(side="left", padx=(8, 0))
         card.pack_propagate(False)
         self.folder_icon = ctk.CTkLabel(card, text="", image=icon(I_FOLDER, BRIGHT, 22), width=34)
         self.folder_icon.pack(side="left", padx=(18, 10))
@@ -731,6 +736,9 @@ class App(ctk.CTk):
         d = filedialog.askdirectory(title=self.t("pick_title"), initialdir=self.folder.get() or None)
         if d:
             self.folder.set(os.path.normpath(d))
+            if not self._busy():  # new folder: old results don't apply, show "folder selected"
+                self.res, self.groups, self.checks = None, [], {}
+                self._render()
             return True
         return False
 
@@ -752,8 +760,13 @@ class App(ctk.CTk):
         folder = p if p.is_dir() else p.parent  # dropped a photo -> use its folder
         for m in list(self.modals):
             m.close()
+        # only choose the folder, don't start right away: the user may still want to change
+        # strictness or options. Old results belong to the old folder, so drop them.
         self.folder.set(os.path.normpath(str(folder)))
-        self._scan()
+        self.res, self.groups, self.checks = None, [], {}
+        self._render()
+        self.folder_card.configure(border_color=BRIGHT)
+        self.after(1200, lambda: self.folder_card.winfo_exists() and self.folder_card.configure(border_color=BORDER))
 
     def _pick_and_scan(self):
         if self._pick():
@@ -1046,6 +1059,13 @@ class App(ctk.CTk):
             self._progress_lbl = label(box, t("prep"), T_HINT, MUTED)
             self._progress_lbl.pack(pady=(12, 0))
             self._stage_t0 = (None, 0.0)
+            return
+        folder = self.folder.get().strip().strip('"')
+        if not self.res and folder and Path(folder).is_dir():
+            # a folder is chosen (picked, dropped or remembered) but not searched yet
+            self._empty_state(t("ready_title"), t("ready_text", name=Path(folder).name or folder),
+                              lambda p: button(p, t("find"), self._scan, "accent", ico=I_SEARCH,
+                                               height=44, width=220))
             return
         if not self.res:
             box = self._empty_state(t("start_title"), t("start_text"),
