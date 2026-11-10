@@ -52,7 +52,7 @@ DEFAULT_THR = 0.85
 I_FOLDER, I_SEARCH, I_STOP, I_CLOSE = "\uE838", "\uE721", "\uE71A", "\uE711"
 I_PREV, I_NEXT, I_TRASH, I_MOVE = "\uE76B", "\uE76C", "\uE74D", "\uE8DE"
 I_UNDO, I_PHOTO, I_CHECK, I_INFO = "\uE7A7", "\uE91B", "\uE73E", "\uE946"
-I_STAR, I_LANG, I_EDIT = "\uE734", "\uE774", "\uE70F"
+I_STAR, I_LANG, I_EDIT, I_PLAY, I_VIDEO = "\uE734", "\uE774", "\uE70F", "\uE768", "\uE714"
 
 _fonts_ok = False
 
@@ -176,11 +176,7 @@ def checkbox(parent, text, var, size=20, fsize=T_BODY):
 
 
 def load_image(p: Path, max_side: int) -> Image.Image:
-    with Image.open(p) as im:
-        im.draft("RGB", (max_side, max_side))
-        im = ImageOps.exif_transpose(im).convert("RGB")
-        im.thumbnail((max_side, max_side), Image.LANCZOS)
-    return im
+    return core.open_picture(p, max_side)  # for a video: its middle frame
 
 
 def open_external(p: Path):
@@ -341,7 +337,8 @@ class Preview(Modal):
         bot.pack_propagate(False)
         self.lbl_info = label(bot, "", T_HINT, MUTED, anchor="w", justify="left")
         self.lbl_info.pack(side="left", padx=28, fill="x", expand=True)
-        button(bot, t("open_photos"), self.open_photos, "accent", ico=I_PHOTO, width=190).pack(side="right", padx=(10, 28))
+        self.btn_open = button(bot, t("open_photos"), self.open_photos, "accent", ico=I_PHOTO, width=190)
+        self.btn_open.pack(side="right", padx=(10, 28))
         button(bot, t("show_folder"), self.reveal, ico=I_FOLDER, width=180).pack(side="right", padx=4)
         self.chk = checkbox(bot, t("remove"), None)
         self.chk.pack(side="right", padx=18)
@@ -357,6 +354,8 @@ class Preview(Modal):
         p = res.files[k]
         orig = self.group[0]
         self.lbl_title.configure(text=p.name)
+        self.btn_open.configure(text=t("open_video" if core.is_video(p) else "open_photos"),
+                                image=icon(I_PLAY if core.is_video(p) else I_PHOTO, ON_ACCENT, 16))
         if k == orig:
             self.badge.configure(text=f"  {t('original')}  ", fg_color=ACCENT, text_color=ON_ACCENT)
         else:
@@ -458,6 +457,7 @@ class App(ctk.CTk):
         except Exception:
             pass
         self.after(30, lambda: dark_title_bar(self))
+        self.after(60, self._enable_drop)
 
         st = load_settings()
         self.lang = st.get("lang") if st.get("lang") in LANGS else default_lang()
@@ -734,6 +734,27 @@ class App(ctk.CTk):
             return True
         return False
 
+    def _enable_drop(self):
+        """Accept a folder dragged from Explorer anywhere onto the window (Windows WM_DROPFILES)."""
+        try:
+            import windnd
+
+            # The callback runs inside the window procedure, where touching Tk (even after()) crashes
+            # Python. So it only drops the paths into the queue that _poll() already reads.
+            windnd.hook_dropfiles(self, func=lambda paths: self.q.put(("drop", list(paths))), force_unicode=True)
+        except Exception:
+            pass  # no windnd / not Windows: the "Choose folder" button still works
+
+    def _on_drop(self, paths):
+        if not paths or self._busy():
+            return
+        p = Path(paths[0] if isinstance(paths[0], str) else paths[0].decode("utf-8", "replace"))
+        folder = p if p.is_dir() else p.parent  # dropped a photo -> use its folder
+        for m in list(self.modals):
+            m.close()
+        self.folder.set(os.path.normpath(str(folder)))
+        self._scan()
+
     def _pick_and_scan(self):
         if self._pick():
             self._scan()
@@ -893,6 +914,8 @@ class App(ctk.CTk):
                     _, rid, lbl, im, k = msg
                     if rid == self._render_id and lbl.winfo_exists():
                         self._set_thumb(lbl, im, k)
+                elif kind == "drop":
+                    self._on_drop(msg[1])
                 elif kind == "preview":
                     _, pv, token, im = msg
                     if pv.winfo_exists():
@@ -1025,9 +1048,10 @@ class App(ctk.CTk):
             self._stage_t0 = (None, 0.0)
             return
         if not self.res:
-            self._empty_state(t("start_title"), t("start_text"),
-                              lambda p: button(p, t("start_btn"), self._pick_and_scan, "accent", ico=I_FOLDER,
-                                               height=44, width=250))
+            box = self._empty_state(t("start_title"), t("start_text"),
+                                    lambda p: button(p, t("start_btn"), self._pick_and_scan, "accent",
+                                                     ico=I_FOLDER, height=44, width=250))
+            label(box, t("drop_hint"), T_HINT, MUTED).pack(pady=(12, 0))
             return
         if not self.groups:
             self._empty_state(t("nodup_title"), t("nodup_text"))
@@ -1084,6 +1108,11 @@ class App(ctk.CTk):
             c = tk.Label(img, text=pct(res.sim(g[0], k)), font=tkfont(T_SMALL, num=True, s=s), fg=BRIGHT,
                          bg="#0b0b0b", padx=round(7 * s), pady=round(1 * s))
         c.place(x=round(10 * s), y=round(10 * s))
+        if core.is_video(p):  # bottom-left "video" chip so videos stand out among photos
+            v = tk.Label(img, text=I_VIDEO, font=(ICON_FAMILY, -round(13 * s)), fg=BRIGHT, bg="#0b0b0b",
+                         padx=round(6 * s), pady=round(4 * s))
+            v.place(x=round(10 * s), rely=1.0, y=-round(10 * s), anchor="sw")
+            v.bind("<Button-1>", lambda _e: Preview(self, g, pos))
         c.bind("<Button-1>", lambda _e: Preview(self, g, pos))
         self._tile_rm[k] = tk.Label(img, text=I_TRASH, font=(ICON_FAMILY, -round(15 * s)), fg=BRIGHT,
                                     bg="#0b0b0b", padx=round(6 * s), pady=round(4 * s))

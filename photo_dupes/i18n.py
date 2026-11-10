@@ -72,7 +72,7 @@ S = {
         "remove": "Удалить",
         "no_preview": "нет превью",
         "start_title": "Выберите папку с фото",
-        "start_text": ("Программа найдёт копии одних и тех же снимков: скриншоты с рамками и полосами, обрезки, "
+        "start_text": ("Программа найдёт копии одних и тех же снимков и видео: скриншоты с рамками и полосами, обрезки, "
                        "пересжатые копии из мессенджеров. В каждой группе оставит лучший оригинал, остальное "
                        "предложит убрать. Без вашего подтверждения ничего не удаляется."),
         "start_btn": "Выбрать папку и начать",
@@ -120,6 +120,8 @@ S = {
         "skipped": ", пропущено: {n}",
         "pick_title": "Папка с фото",
         "open_photos": "Открыть в «Фото»",
+        "open_video": "Открыть в плеере",
+        "drop_hint": "или просто перетащите папку в это окно",
         "show_folder": "Показать в папке",
         "counter": "{i} из {n}   ←  →  ·  пробел — отметить",
         "loading": "Загрузка…",
@@ -189,7 +191,7 @@ S = {
         "remove": "Remove",
         "no_preview": "no preview",
         "start_title": "Choose a photo folder",
-        "start_text": ("The app finds copies of the same shot: screenshots with frames and bars, crops, re-compressed "
+        "start_text": ("The app finds copies of the same shots and videos: screenshots with frames and bars, crops, re-compressed "
                        "copies from messengers. Each group keeps the best original and offers to remove the rest. "
                        "Nothing is deleted without your confirmation."),
         "start_btn": "Choose folder and start",
@@ -236,6 +238,8 @@ S = {
         "skipped": ", skipped: {n}",
         "pick_title": "Photo folder",
         "open_photos": "Open in Photos",
+        "open_video": "Open in player",
+        "drop_hint": "or just drag a folder into this window",
         "show_folder": "Show in folder",
         "counter": "{i} of {n}   ←  →  ·  space — select",
         "loading": "Loading…",

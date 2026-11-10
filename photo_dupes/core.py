@@ -27,7 +27,10 @@ except ImportError:
 
 Image.MAX_IMAGE_PIXELS = None
 
-EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif"}
+VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".3gp", ".wmv"}
+EXTS = IMAGE_EXTS | VIDEO_EXTS
+VIDEO_FRAMES = 5  # frames taken from every video, evenly spread over its length
 DUP_DIR_NAME = "Дубли"
 CACHE_NAME = ".photo_dupes_cache.npz"
 CACHE_VERSION = 2
@@ -78,26 +81,75 @@ def file_sig(p: Path) -> tuple[int, int]:
     return st.st_mtime_ns, st.st_size
 
 
-def preprocess(p: Path):
-    """Image -> model input.
+def is_video(p: Path) -> bool:
+    return p.suffix.lower() in VIDEO_EXTS
+
+
+def video_frames(p: Path, n: int) -> tuple[list[Image.Image], int, int]:
+    """n frames spread over the video (skipping the very start/end, often black), and its size."""
+    import cv2  # imported lazily: only needed when the folder has videos
+
+    cap = cv2.VideoCapture(str(p))
+    try:
+        if not cap.isOpened():
+            raise ValueError("cannot open video")
+        w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        positions = [int(count * (i + 1) / (n + 1)) for i in range(n)] if count > n else [None]
+        frames = []
+        for pos in positions:
+            if pos is not None:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
+            ok, f = cap.read()
+            if ok:
+                frames.append(Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)))
+        if not frames:
+            raise ValueError("no readable frames")
+        return frames, w, h
+    finally:
+        cap.release()
+
+
+def open_picture(p: Path, max_side: int | None = None) -> Image.Image:
+    """RGB picture of a file: the image itself, or the middle frame of a video."""
+    if is_video(p):
+        frames, _, _ = video_frames(p, 1)
+        im = frames[0]
+    else:
+        with Image.open(p) as src:
+            if max_side:
+                src.draft("RGB", (max_side, max_side))  # JPEG: decode at reduced size, much faster
+            im = ImageOps.exif_transpose(src).convert("RGB")
+    if max_side:
+        im.thumbnail((max_side, max_side), Image.LANCZOS)
+    return im
+
+
+def _to_input(im: Image.Image) -> np.ndarray:
+    """Picture -> model input.
 
     Must match what SSCD saw in training (torchvision Resize(288) + Normalize), otherwise
     fingerprints drift. Checked against torchvision: the arrays are identical.
     Note: only the short side becomes 288, so different aspect ratios give different shapes.
     """
+    iw, ih = im.size
+    s = 288
+    if iw <= ih:
+        nw, nh = s, int(s * ih / iw)
+    else:
+        nw, nh = int(s * iw / ih), s
+    a = np.asarray(im.resize((nw, nh), Image.BILINEAR), dtype=np.float32) / 255.0
+    return ((a.transpose(2, 0, 1) - MEAN) / STD).astype(np.float32)
+
+
+def preprocess(p: Path):
+    """Model input for a file: (3, H, W) for an image, (VIDEO_FRAMES, 3, H, W) for a video."""
+    if is_video(p):
+        frames, w, h = video_frames(p, VIDEO_FRAMES)
+        return np.stack([_to_input(f) for f in frames]), w, h
     with Image.open(p) as im:
         w, h = im.size
-        im = ImageOps.exif_transpose(im).convert("RGB")
-        iw, ih = im.size
-        s = 288
-        if iw <= ih:
-            nw, nh = s, int(s * ih / iw)
-        else:
-            nw, nh = int(s * iw / ih), s
-        im = im.resize((nw, nh), Image.BILINEAR)
-        a = np.asarray(im, dtype=np.float32) / 255.0
-    a = (a.transpose(2, 0, 1) - MEAN) / STD
-    return a.astype(np.float32), w, h
+        return _to_input(ImageOps.exif_transpose(im).convert("RGB")), w, h
 
 
 # ----------------------------------------------------------------------------- cache
@@ -221,6 +273,12 @@ def scan(folder: Path, recursive: bool, progress: Progress, cancel: Callable[[],
                 if err:
                     errors.append((p, err))
                     done += 1
+                elif arr.ndim == 4:
+                    # video: its frames form one batch; the video's fingerprint is their average,
+                    # so a re-encoded / trimmed copy still lands close to the original
+                    e = emb(arr).mean(axis=0)
+                    cache[str(p)] = {"sig": file_sig(p), "w": w, "h": h, "emb": e / max(np.linalg.norm(e), 1e-12)}
+                    done += 1
                 else:
                     key = arr.shape
                     buckets.setdefault(key, []).append((p, arr, w, h))
@@ -294,11 +352,7 @@ def content_ratio(p: Path) -> float:
         return _content_memo[key]
     ratio = 1.0
     try:
-        with Image.open(p) as im:
-            im.draft("L", (512, 512))
-            im = ImageOps.exif_transpose(im).convert("L")
-            im.thumbnail((512, 512))
-            a = np.asarray(im, dtype=np.float32)
+        a = np.asarray(open_picture(p, 512).convert("L"), dtype=np.float32)
         r0, r1 = _largest_run(~_bar_lines(a, axis=1))
         if r1 > r0:
             c0, c1 = _largest_run(~_bar_lines(a[r0:r1], axis=0))
