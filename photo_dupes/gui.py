@@ -47,6 +47,7 @@ T_BODY, T_HINT, T_SMALL = 14, 13, 12
 SIDEBAR_W = 360
 TW, TH = 224, 160
 GROUPS_PER_PAGE = 20
+KINDS = ("photo", "video")
 DEFAULT_THR = 0.85
 
 # коды значков из шрифта Segoe Fluent Icons / MDL2
@@ -476,6 +477,7 @@ class App(ctk.CTk):
         self.folder = ctk.StringVar(value=start_folder or st.get("folder", ""))
         self.recursive = ctk.BooleanVar(value=bool(st.get("recursive", False)))
         self.use_gpu = ctk.BooleanVar(value=bool(st.get("gpu", True)))
+        self.kind = st.get("kind") if st.get("kind") in KINDS else "photo"
         self.threshold = ctk.DoubleVar(value=float(st.get("threshold", DEFAULT_THR)))
 
         self.res: core.ScanResult | None = None
@@ -514,7 +516,7 @@ class App(ctk.CTk):
     # ---------------------------------------------------------- настройки и язык
     def _save(self):
         save_settings({"lang": self.lang, "folder": self.folder.get(), "recursive": self.recursive.get(),
-                       "gpu": self.use_gpu.get(), "threshold": round(self.threshold.get(), 2)})
+                       "gpu": self.use_gpu.get(), "threshold": round(self.threshold.get(), 2), "kind": self.kind})
 
     def _on_close(self):
         self._save()
@@ -574,6 +576,15 @@ class App(ctk.CTk):
                                                border_color=BORDER, height=68, cursor="hand2")
         card.pack(**pad)
         card.pack_propagate(False)
+        seg = ctk.CTkFrame(sb, fg_color="transparent")
+        seg.pack(pady=(10, 0), **pad)
+        seg.grid_columnconfigure((0, 1), weight=1, uniform="kind")
+        self.kind_btns = {}
+        for col, (k, ico) in enumerate((("photo", I_PHOTO), ("video", I_VIDEO))):
+            b = button(seg, t(f"kind_{k}"), lambda k=k: self._set_kind(k), ico=ico, height=36)
+            b.grid(row=0, column=col, sticky="ew", padx=(0, 4) if col == 0 else (4, 0))
+            self.kind_btns[k] = b
+        self._paint_kind()
         self.folder_icon = ctk.CTkLabel(card, text="", image=icon(I_FOLDER, BRIGHT, 22), width=34)
         self.folder_icon.pack(side="left", padx=(18, 10))
         txt = ctk.CTkFrame(card, fg_color="transparent")
@@ -755,6 +766,27 @@ class App(ctk.CTk):
         self.folder_card.configure(border_color=BRIGHT)
         self.after(1200, lambda: self.folder_card.winfo_exists() and self.folder_card.configure(border_color=BORDER))
 
+    def _paint_kind(self):
+        for k, b in self.kind_btns.items():
+            on = k == self.kind
+            restyle(b, fg_color=ACCENT if on else TILE, hover_color=ACCENT_H if on else HOVER,
+                    text_color=ON_ACCENT if on else TEXT, border_color=ACCENT if on else BORDER,
+                    image=icon(I_PHOTO if k == "photo" else I_VIDEO, ON_ACCENT if on else TEXT, 16))
+            b._ico = (b._ico[0], ON_ACCENT if on else TEXT, b._ico[2])
+
+    def _set_kind(self, kind):
+        # Фото и видео ищем отдельно: так видео не попадают в группы к картинкам,
+        # а поиск по фото не ждёт, пока прочитаются все ролики.
+        if kind == self.kind or self._busy():
+            return
+        self.kind = kind
+        self._save()
+        self._paint_kind()
+        self.lbl_head.configure(text=self.t(f"title_{kind}"))
+        if self.res:  # результаты были для другого типа файлов
+            self.res, self.groups, self.checks = None, [], {}
+            self._render()
+
     def _pick_and_scan(self):
         if self._pick():
             self._scan()
@@ -804,7 +836,7 @@ class App(ctk.CTk):
     def _update_stats(self):
         t, r = self.t, self.res
         if not r:
-            self.lbl_head.configure(text=t("title_empty"))
+            self.lbl_head.configure(text=t(f"title_{self.kind}"))
             self.pill.pack_forget()
             self.lbl_sub.configure(text="")
             self.lbl_sel.configure(text="")
@@ -816,9 +848,9 @@ class App(ctk.CTk):
             self.pill.pack(side="left", padx=(10, 0), pady=(2, 0))
             self.lbl_sub.configure(text=f"{t.n('sub', n_dup)} {t('sub_of', m=len(r.files))}")
         else:
-            self.lbl_head.configure(text=t("no_dupes_title"))
+            self.lbl_head.configure(text=t("no_dupes_title") if r.files else t(f"title_{self.kind}"))
             self.pill.pack_forget()
-            self.lbl_sub.configure(text=t("checked", n=len(r.files)))
+            self.lbl_sub.configure(text=t("checked", n=len(r.files)) if r.files else "")
         marked = [k for k, v in self.checks.items() if v.get()]
         self.lbl_sel.configure(text=t("marked", n=len(marked), size=t.size(sum(self.size_of(k) for k in marked)))
                                if marked else (t("none_marked") if self.groups else ""))
@@ -847,12 +879,12 @@ class App(ctk.CTk):
         self.groups, self.res, self.checks = [], None, {}
         self._last_progress = None
         self.lbl_summary.configure(text="")
-        rec, gpu = self.recursive.get(), self.use_gpu.get()
+        rec, gpu, kind = self.recursive.get(), self.use_gpu.get(), self.kind
 
         def work():
             try:
                 res = core.scan(folder, rec, lambda s, d, n: self.q.put(("progress", s, d, n)),
-                                lambda: self._cancel, use_gpu=gpu)
+                                lambda: self._cancel, use_gpu=gpu, kind=kind)
                 self.q.put(("done", res))
             except InterruptedError:
                 self.q.put(("cancelled",))
@@ -1056,6 +1088,9 @@ class App(ctk.CTk):
                                     lambda p: button(p, t("start_btn"), self._pick_and_scan, "accent",
                                                      ico=I_FOLDER, height=44, width=250))
             label(box, t("drop_hint"), T_HINT, MUTED).pack(pady=(12, 0))
+            return
+        if not self.res.files:  # в папке вообще нет файлов этого типа — это не «дублей нет»
+            self._empty_state(t(f"none_{self.kind}"), t("none_text"))
             return
         if not self.groups:
             self._empty_state(t("nodup_title"), t("nodup_text"))

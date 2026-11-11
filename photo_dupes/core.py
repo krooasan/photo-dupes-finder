@@ -32,6 +32,7 @@ Image.MAX_IMAGE_PIXELS = None  # огромные панорамы и длинн
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif"}
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".3gp", ".wmv"}
 EXTS = IMAGE_EXTS | VIDEO_EXTS
+KIND_EXTS = {"photo": IMAGE_EXTS, "video": VIDEO_EXTS, None: EXTS}
 # сколько кадров берём из видео: по одному на 5 секунд, но от 8 до 32
 VIDEO_FRAMES_MIN, VIDEO_FRAMES_MAX, VIDEO_SEC_PER_FRAME = 8, 32, 5
 DUP_DIR_NAME = "Дубли"
@@ -75,9 +76,10 @@ def _hidden(st: os.stat_result, name: str) -> bool:
     return name.startswith(".") or bool(attrs & (stat.FILE_ATTRIBUTE_HIDDEN | stat.FILE_ATTRIBUTE_SYSTEM))
 
 
-def collect_files(folder: Path, recursive: bool) -> list[Path]:
-    """Все фото и видео в папке. Скрытые и системные файлы, пустые файлы, Корзину
-    ($RECYCLE.BIN), «System Volume Information» и нашу папку «Дубли» пропускаем."""
+def collect_files(folder: Path, recursive: bool, kind: str | None = None) -> list[Path]:
+    """Фото (kind="photo"), видео (kind="video") или всё сразу (None). Скрытые и системные файлы,
+    пустые файлы, Корзину ($RECYCLE.BIN), «System Volume Information» и нашу папку «Дубли» пропускаем."""
+    exts = KIND_EXTS[kind]
     out = []
     # onerror=None: папки без доступа просто молча пропускаются, а не роняют поиск
     for root, dirs, names in os.walk(folder, onerror=None):
@@ -87,7 +89,7 @@ def collect_files(folder: Path, recursive: bool) -> list[Path]:
         else:
             dirs[:] = []
         for name in names:
-            if Path(name).suffix.lower() not in EXTS:
+            if Path(name).suffix.lower() not in exts:
                 continue
             p = Path(root) / name
             try:
@@ -289,10 +291,10 @@ class ScanResult:
 
 
 def scan(folder: Path, recursive: bool, progress: Progress, cancel: Callable[[], bool],
-         use_gpu: bool = True, batch_size: int = 16) -> ScanResult:
+         use_gpu: bool = True, batch_size: int = 16, kind: str | None = None) -> ScanResult:
     t0 = time.time()
     progress("files", 0, 0)
-    files = collect_files(folder, recursive)
+    files = collect_files(folder, recursive, kind)
     cache_path = folder / CACHE_NAME
     cache = load_cache(cache_path)
     sigs = {p: file_sig(p) for p in files}
