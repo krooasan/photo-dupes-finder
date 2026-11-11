@@ -13,7 +13,7 @@ from pathlib import Path
 from tkinter import filedialog
 
 import customtkinter as ctk
-from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageOps, ImageTk
 
 from . import __version__, core
 from .i18n import LANGS, Tr, default_lang, load_settings, save_settings
@@ -234,13 +234,13 @@ def checkbox(parent, text, var, size=20, fsize=T_BODY):
                            fg_color=ACCENT, hover_color=ACCENT_H, checkmark_color=ON_ACCENT, border_width=2)
 
 
-def _thumb_pair(im: Image.Image):
-    """Картинка для плитки, её затемнённая серая копия (для «пойдёт в дубли») и размер.
+def _thumb_pair(im: Image.Image, box: tuple[int, int]):
+    """Картинка для плитки (уже нужного размера) и её затемнённая серая копия для «пойдёт в дубли».
     Считается в фоновом потоке: на главном это заметно тормозило, когда превью приходили пачкой."""
-    r = min((TW - 8) / im.width, (TH - 8) / im.height)
-    size = (max(1, int(im.width * r)), max(1, int(im.height * r)))
+    r = min(box[0] / im.width, box[1] / im.height)
+    im = im.resize((max(1, int(im.width * r)), max(1, int(im.height * r))), Image.LANCZOS)
     dim = ImageEnhance.Brightness(ImageOps.grayscale(im).convert("RGB")).enhance(DIM)
-    return im, dim, size
+    return im, dim
 
 
 def load_image(p: Path, max_side: int) -> Image.Image:
@@ -290,84 +290,178 @@ def dark_title_bar(win, color=SIDE, text=BRIGHT):
 WHEEL_PX = 130  # на сколько пикселей прокручивает один щелчок колеса
 
 
-class SmoothScroll(ctk.CTkScrollableFrame):
-    """Список с плавной прокруткой.
+class Page(ctk.CTkFrame):
+    """Область результатов: один холст с плавной прокруткой.
 
-    Обычный CTkScrollableFrame двигает содержимое рывком на каждое событие колеса и не ждёт,
-    пока сотни вложенных виджетов перерисуются, — при быстрой прокрутке картинка рвалась на полосы.
-    Здесь колесо и ползунок только задают, куда надо доехать, а едем мы сами: не чаще раза
-    в ~12 мс и каждый раз даём окну дорисоваться.
+    Раньше каждая плитка была набором отдельных виджетов (а в Windows каждый виджет — своё окошко),
+    и при быстрой прокрутке сотни окошек не успевали перерисоваться: картинка рвалась на полосы.
+    Теперь вся страница нарисована на одном холсте, он сдвигается и перерисовывается целиком.
+    Колесо и ползунок только задают, куда надо доехать, а едем мы сами, с замедлением к концу.
     """
 
-    def __init__(self, *a, **kw):
-        super().__init__(*a, **kw)
+    def __init__(self, master):
+        super().__init__(master, fg_color=BG, corner_radius=0)
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        self.canvas = tk.Canvas(self, bg=BG, highlightthickness=0, bd=0)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.bar = ctk.CTkScrollbar(self, command=self._from_bar, fg_color=BG, button_color=BORDER_HI,
+                                    button_hover_color="#5a5a5a")
+        self.bar.grid(row=0, column=1, sticky="ns")
+        self.canvas.configure(yscrollcommand=self.bar.set)
+        self.canvas.bind("<Configure>", self._center, add="+")
+        self.canvas.bind_all("<MouseWheel>", self._wheel, add="+")
+        self._h = 1          # высота нарисованного, в пикселях
         self._to = None      # куда едем, доля от 0 до 1
         self._jump = False   # ползунок тянут мышью: без разгона, сразу в точку
         self._job = None
-        self._moving = False  # идёт шаг прокрутки (см. _tick)
-        self._scrollbar.configure(command=self._from_bar)
 
-    def reset(self):
+    def clear(self):
+        self.canvas.delete("all")
+        for w in self.canvas.winfo_children():
+            w.destroy()
         self._to = None
-        self._parent_canvas.yview_moveto(0)
+        self.set_height(1)
+        self.canvas.yview_moveto(0)
 
-    def _height(self) -> int:
-        box = self._parent_canvas.bbox("all")
-        return max(1, box[3] - box[1]) if box else 1
+    def set_height(self, h):
+        self._h = max(1, int(h))
+        self.canvas.configure(scrollregion=(0, 0, 1, self._h))
+
+    def host(self, widget):
+        """Показать обычный виджет (экран «Выберите папку», прогресс) по центру сверху."""
+        y = round(120 * self._get_widget_scaling())
+        self.canvas.create_window(self.canvas.winfo_width() // 2, y, anchor="n", window=widget, tags="host")
+
+    def _center(self, e):
+        self.canvas.coords("host", e.width // 2, round(120 * self._get_widget_scaling()))
 
     def _from_bar(self, *args):
         if args and args[0] == "moveto":
             self._to, self._jump = float(args[1]), True
             self._kick()
         else:
-            self._parent_canvas.yview(*args)
+            self.canvas.yview(*args)
 
-    def _mouse_wheel_all(self, event):
-        if getattr(self.winfo_toplevel(), "modals", None):  # открыт просмотр или диалог — список под ним не трогаем
+    def _wheel(self, event):
+        if not self.winfo_exists():
             return
-        if not self._check_if_valid_scroll(event.widget):
+        if getattr(self.winfo_toplevel(), "modals", None):  # открыт просмотр или диалог — страницу под ним не трогаем
             return
-        top, bottom = self._parent_canvas.yview()
+        if not str(event.widget).startswith(str(self)):
+            return
+        top, bottom = self.canvas.yview()
         if bottom - top >= 1:
             return
-        step = -event.delta / 120 * WHEEL_PX * self._get_widget_scaling() / self._height()
+        step = -event.delta / 120 * WHEEL_PX * self._get_widget_scaling() / self._h
         start = top if self._to is None else self._to
         self._to, self._jump = min(max(start + step, 0.0), 1.0 - (bottom - top)), False
         self._kick()
 
     def _kick(self):
-        if self._job is None and not self._moving:
+        if self._job is None:
             self._job = self.after(8, self._tick)
 
     def _tick(self):
         self._job = None
         if self._to is None or not self.winfo_exists():
             return
-        cv = self._parent_canvas
+        cv = self.canvas
         top, bottom = cv.yview()
         target = min(max(self._to, 0.0), max(0.0, 1.0 - (bottom - top)))
         left = target - top
-        if self._jump or abs(left) * self._height() < 1.5:
+        if self._jump or abs(left) * self._h < 1.5:
             new, self._to = target, None
         else:
-            new = top + left * 0.3
+            new = top + left * 0.22
         cv.yview_moveto(new)
-        # Плитки — это отдельные окна Windows: сдвигаются они сразу, а дорисовываются по сообщению,
-        # которое ждёт в очереди. update() обрабатывает очередь прямо сейчас, поэтому каждый кадр целый.
-        # Он же может принять новый щелчок колеса или клик — на это время ставим флаг, чтобы шаг
-        # не запустился внутри самого себя.
-        self._moving = True
-        try:
-            self.update()
-        finally:
-            self._moving = False
-        if not self.winfo_exists():
-            return
+        cv.update_idletasks()  # дорисовать кадр до следующего шага
         if self._to is not None:
-            if abs(cv.yview()[0] - top) < 1e-9 and not self._jump:  # упёрлись в край, дальше ехать некуда
+            if abs(cv.yview()[0] - top) < 1e-9:  # упёрлись в край, дальше ехать некуда
                 self._to = None
             else:
                 self._job = self.after(8, self._tick)
+
+
+# Холст Tk рисует фигуры без сглаживания, поэтому скруглённые рамки, галочки и кружок загрузки
+# готовим картинками: рисуем в 4 раза крупнее и уменьшаем.
+_shape_cache: dict = {}
+
+
+def _rounded_pil(w, h, r, fill, outline=None, width=0, bg=CARD) -> Image.Image:
+    k = 4
+    im = Image.new("RGB", (w * k, h * k), bg)
+    ImageDraw.Draw(im).rounded_rectangle((0, 0, w * k - 1, h * k - 1), r * k, fill=fill, outline=outline,
+                                         width=width * k)
+    return im.resize((w, h), Image.LANCZOS)
+
+
+def tile_image(w, h, r, border, color):
+    key = ("tile", w, h, r, border, color)
+    if key not in _shape_cache:
+        _shape_cache[key] = ImageTk.PhotoImage(_rounded_pil(w, h, r, TILE, color, border))
+    return _shape_cache[key]
+
+
+def check_image(size, r, border, on: bool):
+    key = ("check", size, on)
+    if key not in _shape_cache:
+        if on:
+            k = 4
+            im = Image.new("RGB", (size * k, size * k), CARD)
+            d = ImageDraw.Draw(im)
+            d.rounded_rectangle((0, 0, size * k - 1, size * k - 1), r * k, fill=ACCENT)
+            pts = [(0.24, 0.53), (0.43, 0.71), (0.77, 0.32)]
+            d.line([(x * size * k, y * size * k) for x, y in pts], fill=ON_ACCENT, width=round(size * k * 0.11),
+                   joint="curve")
+            im = im.resize((size, size), Image.LANCZOS)
+        else:
+            im = _rounded_pil(size, size, r, CARD, BORDER_HI, border)
+        _shape_cache[key] = ImageTk.PhotoImage(im)
+    return _shape_cache[key]
+
+
+def card_image(w, h, r):
+    """Подложка группы. Большую картинку целиком в 4 раза крупнее рисовать дорого,
+    поэтому сглаженные только углы — их берём из маленького образца."""
+    c = r + 2
+    key = ("corner", r)
+    if key not in _shape_cache:
+        _shape_cache[key] = _rounded_pil(2 * c, 2 * c, r, CARD, BORDER, 1, bg=BG)
+    small = _shape_cache[key]
+    im = Image.new("RGB", (w, h), CARD)
+    ImageDraw.Draw(im).rectangle((0, 0, w - 1, h - 1), outline=BORDER)
+    for sx, dx in ((0, 0), (c, w - c)):
+        for sy, dy in ((0, 0), (c, h - c)):
+            im.paste(small.crop((sx, sy, sx + c, sy + c)), (dx, dy))
+    return ImageTk.PhotoImage(im)
+
+
+def spinner(parent, size=40):
+    """Крутящийся кружок: показывает, что программа работает, даже когда полоса прогресса стоит."""
+    px = round(size * parent._get_widget_scaling())
+    key = ("spin", px)
+    if key not in _shape_cache:
+        k, n, frames = 4, 36, []
+        box = (2 * k, 2 * k, px * k - 2 * k, px * k - 2 * k)
+        w = max(k, round(px * k * 0.09))
+        for i in range(n):
+            im = Image.new("RGB", (px * k, px * k), BG)
+            d = ImageDraw.Draw(im)
+            d.arc(box, 0, 360, fill=BORDER, width=w)
+            d.arc(box, 360 * i / n, 360 * i / n + 95, fill=BRIGHT, width=w)
+            frames.append(ImageTk.PhotoImage(im.resize((px, px), Image.LANCZOS)))
+        _shape_cache[key] = frames
+    frames = _shape_cache[key]
+    lbl = tk.Label(parent, image=frames[0], bg=BG, bd=0)
+
+    def spin(i=0):
+        if lbl.winfo_exists():
+            lbl.configure(image=frames[i % len(frames)])
+            lbl.after(28, spin, i + 1)
+
+    spin()
+    return lbl
 
 
 # ------------------------------------------------------------------ всплывающие окна
@@ -640,14 +734,15 @@ class App(ctk.CTk):
         self._worker: threading.Thread | None = None
         self._regroup_job = None
         self._resize_job = None
-        self._cols = 0
+        self._cols = 1
         self._pbar_to = 0.0
         self._render_id = 0
-        self._tiles: dict[int, ctk.CTkLabel] = {}
-        self._tile_imgs: dict[int, tuple] = {}
-        self._tile_rm: dict[int, tk.Label] = {}
-        self._thumb_imgs: list = []
-        self._thumb_cache: dict[str, Image.Image] = {}
+        self._tiles: dict[int, dict] = {}    # что нарисовано на странице для каждого файла (номера элементов холста)
+        self._thumbs: dict[int, tuple] = {}  # превью: (обычное, затемнённое)
+        self._page_imgs: list = []           # подложки групп; Tk не держит картинки сам, без ссылки они пропадут
+        self._hover_k = None
+        self._page_w = 0
+        self._thumb_cache: dict = {}
         self._pool = ThreadPoolExecutor(max_workers=4)
         self._stage_t0 = (None, 0.0)
         self._progress_lbl = None
@@ -660,7 +755,6 @@ class App(ctk.CTk):
         self.folder.trace_add("write", lambda *_a: self._paint_folder())
         self._build_ui()
         self.bind_all("<Key>", self._on_key)
-        self.bind("<Configure>", self._on_resize)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._poll)
 
@@ -683,6 +777,14 @@ class App(ctk.CTk):
         self._build_ui()
 
     def _build_ui(self):
+        cover = None
+        if self._frames:
+            # Смена языка пересоздаёт весь интерфейс. Старые виджеты исчезают, а новые встают на места
+            # не одновременно — на секунду было видно кнопки не там. На это время закрываем окно ширмой.
+            cover = tk.Frame(self, bg=BG)
+            cover.place(x=0, y=0, relwidth=1, relheight=1)
+            cover.lift()
+            self.update_idletasks()
         for f in self._frames:
             f.destroy()
         self._build_sidebar()
@@ -691,7 +793,12 @@ class App(ctk.CTk):
         self._frames = [self.sidebar, self.main, self.status]
         self._on_threshold(regroup=False)
         self._paint_folder()
+        if cover:
+            cover.lift()
         self._render()
+        if cover:
+            self.update_idletasks()
+            cover.destroy()
         if self._busy() and self._last_progress:
             self._progress(*self._last_progress)
 
@@ -848,9 +955,16 @@ class App(ctk.CTk):
             b.pack(side="left", padx=(0, 8))
             self.chips[m] = b
 
-        self.results = SmoothScroll(main, fg_color=BG, corner_radius=0,
-                                    scrollbar_button_color=BORDER_HI,
-                                    scrollbar_button_hover_color="#5a5a5a")
+        self.results = Page(main)
+        cv = self.results.canvas
+        # одни обработчики на все плитки: какой файл под курсором, узнаём по метке элемента
+        cv.tag_bind("tile", "<Button-1>", self._tile_click)
+        cv.tag_bind("tile", "<Enter>", lambda _e: self._tile_hover(True))
+        cv.tag_bind("tile", "<Leave>", lambda _e: self._tile_hover(False))
+        cv.tag_bind("chk", "<Button-1>", self._chk_click)
+        cv.tag_bind("chk", "<Enter>", lambda _e: cv.configure(cursor="hand2"))
+        cv.tag_bind("chk", "<Leave>", lambda _e: cv.configure(cursor=""))
+        cv.bind("<Configure>", lambda _e: self._schedule_reflow(), add="+")
         self.results.grid(row=2, column=0, sticky="nsew", padx=(28, 8), pady=(14, 0))
 
         bar = ctk.CTkFrame(main, fg_color=SIDE, corner_radius=0, height=68)
@@ -1106,9 +1220,9 @@ class App(ctk.CTk):
                     self._render()
                     self.info(self.t("err_title"), msg[1])
                 elif kind == "thumb":
-                    _, rid, lbl, im, k = msg
-                    if rid == self._render_id and lbl.winfo_exists():
-                        self._set_thumb(lbl, im, k)
+                    _, rid, k, pair = msg
+                    if rid == self._render_id and k in self._tiles:
+                        self._set_thumb(k, pair)
                 elif kind == "drop":
                     self._on_drop(msg[1])
                 elif kind == "preview":
@@ -1176,19 +1290,19 @@ class App(ctk.CTk):
 
     def _paint_tile(self, k):
         # белая рамка — файл остаётся; затемнение и значок корзины — файл пойдёт в дубли
-        tl = self._tiles.get(k)
-        if tl is None or not tl.winfo_exists():
+        it = self._tiles.get(k)
+        if it is None:
             return
-        tl.configure(border_color=self._tile_color(k))
-        pair = self._tile_imgs.get(k)
+        cv, marked = self.results.canvas, self._marked(k)
+        s = self.results._get_widget_scaling()
+        color = ACCENT if not marked else (HOVER_BORDER if self._hover_k == k else TILE)
+        cv.itemconfigure(it["frame"], image=tile_image(round((TW + 8) * s), round(TH * s), round(8 * s),
+                                                       max(1, round(2 * s)), color))
+        pair = self._thumbs.get(k)
         if pair:
-            tl.configure(image=pair[1] if self._marked(k) else pair[0])
-        chip = self._tile_rm.get(k)
-        if chip is not None:
-            if self._marked(k):
-                chip.place(relx=1.0, rely=0.0, x=-10, y=10, anchor="ne")
-            else:
-                chip.place_forget()
+            cv.itemconfigure(it["thumb"], image=pair[1] if marked else pair[0])
+        cv.itemconfigure(f"rm{k}", state="normal" if marked else "hidden")
+        cv.itemconfigure(it["chk"], image=check_image(round(18 * s), round(5 * s), max(1, round(2 * s)), marked))
 
     def _on_check(self, k):
         self._paint_tile(k)
@@ -1203,41 +1317,34 @@ class App(ctk.CTk):
         self._update_stats()
         self._update_controls()
 
-    def _tile_color(self, k, hover=False):
-        # белая рамка у всех файлов, которые остаются, а не только у оригинала:
-        # после «Старые»/«Новые» сразу видно, что именно останется в папке
-        if not self._marked(k):
-            return ACCENT
-        return HOVER_BORDER if hover else TILE
-
     def _clear(self):
         self._render_id += 1
-        for w in self.results.winfo_children():
-            w.destroy()
+        self.results.clear()
         self._tiles.clear()
-        self._tile_imgs.clear()
-        self._tile_rm.clear()
-        self._thumb_imgs.clear()
+        self._thumbs.clear()
+        self._page_imgs.clear()
+        self._hover_k = None
         self._progress_lbl = None
-        self.results.reset()
 
-    def _empty_state(self, title, text, action=None):
-        box = ctk.CTkFrame(self.results, fg_color="transparent")
-        box.pack(pady=(120, 0))
+    def _empty_state(self, title, text, action=None, busy=False):
+        box = ctk.CTkFrame(self.results.canvas, fg_color=BG)
+        if busy:
+            spinner(box).pack(pady=(0, 20))
         label(box, title, 18, BRIGHT, "bold").pack()
         label(box, text, T_BODY, MUTED, justify="center", wraplength=540).pack(pady=(10, 24))
         if action:
             action(box).pack()
+        self.results.host(box)
         return box
 
-    def _render(self):
+    def _render(self, scroll_to=None):
         t = self.t
         self._clear()
         self._update_controls()
         self._update_stats()
         self.update_idletasks()  # дорисовать кнопки внизу до того, как начнём строить тяжёлую страницу
         if self._busy():
-            box = self._empty_state(t("scan_title"), t("scan_text"))
+            box = self._empty_state(t("scan_title"), t("scan_text"), busy=True)
             self._pbar = ctk.CTkProgressBar(box, width=460, height=8, corner_radius=4, fg_color=BORDER_HI,
                                             progress_color=BRIGHT)
             self._pbar.set(0)
@@ -1267,126 +1374,164 @@ class App(ctk.CTk):
         if not self.groups:
             self._empty_state(t("nodup_title"), t("nodup_text"))
             return
-        s = self.results._get_widget_scaling()
-        cols = self._cols = self._cols_now()
+        # Саму страницу рисуем чуть позже: кнопки внизу только что перенастроены, и окну нужно
+        # успеть их перерисовать. Иначе, пока строится страница, они висят недорисованными.
+        self.after(30, self._draw_later, self._render_id, scroll_to)
+
+    def _draw_later(self, rid, scroll_to):
+        if rid != self._render_id:  # пока ждали, страницу уже сменили
+            return
+        self._cols, self._page_w = self._cols_now(), self._page_width()
         start = self.page * GROUPS_PER_PAGE
-        todo = list(enumerate(self.groups[start:start + GROUPS_PER_PAGE], start + 1))
-        self.after(30, self._render_chunk, self._render_id, todo, cols, s)  # сначала даём окну дорисовать кнопки
+        self._draw_page(list(enumerate(self.groups[start:start + GROUPS_PER_PAGE], start + 1)))
+        if scroll_to:
+            self.results.canvas.yview_moveto(scroll_to)
+
+    def _page_width(self) -> int:
+        s = self.results._get_widget_scaling()
+        w = self.results.canvas.winfo_width()
+        if w < 50:  # холст ещё не размечен (окно только что перестроили) — считаем от ширины окна
+            w = self.winfo_width() - round((SIDEBAR_W + 52) * s)
+        return max(w, round(300 * s))
 
     def _cols_now(self) -> int:
-        s = self.results._get_widget_scaling()
-        # сразу после перестройки фрейм ещё не размечен и его ширина 0 — берём ширину окна минус панель
-        avail = max(self.results.winfo_width() / s, self.winfo_width() / s - SIDEBAR_W - 40, 400)
-        return max(1, int((avail - 60) // (TW + 16)))
+        return max(1, int((self._page_width() / self.results._get_widget_scaling() - 40) // (TW + 20)))
 
-    def _on_resize(self, e):
-        # <Configure> прилетает и от всех вложенных виджетов, нам нужно только само окно
-        if e.widget is not self:
-            return
+    def _schedule_reflow(self):
         if self._resize_job:
             self.after_cancel(self._resize_job)
-        self._resize_job = self.after(250, self._reflow)
+        self._resize_job = self.after(200, self._reflow)
 
     def _reflow(self):
-        # окно растянули или сжали — если теперь влезает другое число плиток в ряд, перестраиваем страницу
+        # окно растянули или сжали — перерисовываем страницу под новую ширину, прокрутку оставляем где была
         self._resize_job = None
-        if self.groups and not self._busy() and not self.modals and self._cols_now() != self._cols:
-            self._render()
+        if self.groups and not self._busy() and not self.modals and self._page_width() != self._page_w:
+            self._render(scroll_to=self.results.canvas.yview()[0])
 
-    def _render_chunk(self, rid, todo, cols, s):
-        # Группы добавляются по 3 штуки через after(), чтобы окно не зависало, пока страница заполняется.
-        # Каждый виджет CTk — это отдельный canvas, создаётся медленно (страница из 20 групп рисовалась
-        # ~3,7 с), поэтому подписи на плитках — обычные tk.Label, так раза в два быстрее.
-        # rid нужен, чтобы выкинуть недорисованные куски, если пользователь уже переключил страницу.
-        if rid != self._render_id or not todo:
-            return
-        t = self.t
-        for gi, g in todo[:3]:
-            box = ctk.CTkFrame(self.results, fg_color=CARD, corner_radius=12, border_width=1, border_color=BORDER)
-            box.pack(fill="x", pady=(0, 14), padx=(0, 8))
-            hd = tk.Frame(box, bg=CARD)
-            hd.pack(fill="x", padx=22, pady=(16, 0))
-            tk.Label(hd, text=t("group", i=gi), font=tkfont(T_BODY, "bold", s=s), fg=BRIGHT, bg=CARD).pack(side="left")
-            tk.Label(hd, text="   " + t.n("files", len(g)), font=tkfont(T_HINT, s=s), fg=MUTED,
-                     bg=CARD).pack(side="left")
-            grid = tk.Frame(box, bg=CARD)
-            grid.pack(fill="x", padx=16, pady=(12, 16))
+    def _draw_page(self, todo):
+        """Рисует группы страницы на холсте. Размеры ниже — в «логических» пикселях, P() переводит
+        их в настоящие с учётом масштаба Windows (125%, 150%…)."""
+        cv, t = self.results.canvas, self.t
+        s = self.results._get_widget_scaling()
+
+        def P(v):
+            return round(v * s)
+
+        cols = self._cols
+        width = self._page_w - P(8)
+        y = 0
+        for gi, g in todo:
+            rows = -(-len(g) // cols)
+            h = P(328) + (rows - 1) * P(259)
+            card = card_image(width, h, P(12))
+            self._page_imgs.append(card)
+            cv.create_image(0, y, anchor="nw", image=card)
+            title = cv.create_text(P(22), y + P(38), anchor="sw", text=t("group", i=gi), fill=BRIGHT,
+                                   font=tkfont(T_BODY, "bold", s=s))
+            cv.create_text(cv.bbox(title)[2] + P(14), y + P(37), anchor="sw", text=t.n("files", len(g)),
+                           fill=MUTED, font=tkfont(T_HINT, s=s))
             for pos, k in enumerate(g):
-                self._tile(grid, g, pos, k, s).grid(row=pos // cols, column=pos % cols, padx=6, pady=4, sticky="n")
-        # Tk перерисовывает окно только в «свободное время», а цепочка after(1) его не оставляет:
-        # кнопки внизу, перенастроенные в начале, висели недорисованными, пока не догрузится вся страница.
-        self.update_idletasks()
-        self.after(5, self._render_chunk, rid, todo[3:], cols, s)
+                self._draw_tile(g, pos, k, P(22) + (pos % cols) * P(TW + 20), y + P(60) + (pos // cols) * P(259), s)
+            y += h + P(14)
+        self.results.set_height(y)
 
-    def _tile(self, parent, g, pos, k, s):
-        t, res = self.t, self.res
+    def _chip(self, x, y, anchor, text, font, fg, bg, px, py, tags):
+        # плашка поверх картинки: текст и прямоугольник под ним
+        cv = self.results.canvas
+        tid = cv.create_text(x, y, anchor=anchor, text=text, font=font, fill=fg, tags=tags)
+        dx, dy = (px if "w" in anchor else -px), (py if "n" in anchor else -py)
+        cv.move(tid, dx, dy)
+        x0, y0, x1, y1 = cv.bbox(tid)
+        rid = cv.create_rectangle(x0 - px, y0 - py, x1 + px, y1 + py, fill=bg, outline="", tags=tags)
+        cv.tag_raise(tid, rid)
+
+    def _draw_tile(self, g, pos, k, x, y, s):
+        cv, t, res = self.results.canvas, self.t, self.res
+
+        def P(v):
+            return round(v * s)
+
         p = res.files[k]
-        cell = tk.Frame(parent, bg=CARD)
-        img = ctk.CTkLabel(cell, text="", width=TW, height=TH, fg_color=TILE, corner_radius=8,
-                           border_width=2, border_color=self._tile_color(k), cursor="hand2", bg_color=CARD)
-        img.pack()
-        self._tiles[k] = img
-        img.bind("<Button-1>", lambda _e: Preview(self, g, pos))
-        img.bind("<Enter>", lambda _e: img.configure(border_color=self._tile_color(k, hover=True)))
-        img.bind("<Leave>", lambda _e: img.configure(border_color=self._tile_color(k)))
-
-        # плашки поверх картинки, как значки на обложках в библиотеке Hydra
+        w, h = P(TW + 8), P(TH)
+        tags = ("tile", f"k{k}")
+        it = self._tiles[k] = {"g": g, "pos": pos}
+        it["frame"] = cv.create_image(x, y, anchor="nw", tags=tags)
+        it["thumb"] = cv.create_image(x + w // 2, y + h // 2, tags=tags)
+        dark = "#0b0b0b"
         if pos == 0:
-            c = tk.Label(img, text=t("original"), font=tkfont(T_SMALL, "bold", s=s), fg=ON_ACCENT, bg=ACCENT,
-                         padx=round(7 * s), pady=round(1 * s))
+            self._chip(x + P(10), y + P(10), "nw", t("original"), tkfont(T_SMALL, "bold", s=s), ON_ACCENT, ACCENT,
+                       P(7), P(2), tags)
         else:
-            c = tk.Label(img, text=pct(res.sim(g[0], k)), font=tkfont(T_SMALL, num=True, s=s), fg=BRIGHT,
-                         bg="#0b0b0b", padx=round(7 * s), pady=round(1 * s))
-        c.place(x=round(10 * s), y=round(10 * s))
+            self._chip(x + P(10), y + P(10), "nw", pct(res.sim(g[0], k)), tkfont(T_SMALL, num=True, s=s), BRIGHT,
+                       dark, P(7), P(2), tags)
         if core.is_video(p):  # плашка «видео» в левом нижнем углу, чтобы видео не терялись среди фото
-            v = tk.Label(img, text=I_VIDEO, font=(ICON_FAMILY, -round(13 * s)), fg=BRIGHT, bg="#0b0b0b",
-                         padx=round(6 * s), pady=round(4 * s))
-            v.place(x=round(10 * s), rely=1.0, y=-round(10 * s), anchor="sw")
-            v.bind("<Button-1>", lambda _e: Preview(self, g, pos))
-        c.bind("<Button-1>", lambda _e: Preview(self, g, pos))
-        self._tile_rm[k] = tk.Label(img, text=I_TRASH, font=(ICON_FAMILY, -round(15 * s)), fg=BRIGHT,
-                                    bg="#0b0b0b", padx=round(6 * s), pady=round(4 * s))
-        self._request_thumb(img, p, k)
+            self._chip(x + P(10), y + h - P(10), "sw", I_VIDEO, (ICON_FAMILY, -P(13)), BRIGHT, dark, P(6), P(4), tags)
+        self._chip(x + w - P(10), y + P(10), "ne", I_TRASH, (ICON_FAMILY, -P(15)), BRIGHT, dark, P(6), P(4),
+                   tags + (f"rm{k}",))
 
         name = p.name if len(p.name) <= 28 else p.name[:25] + "…"
-        tk.Label(cell, text=name, font=tkfont(T_HINT, "medium", s=s), fg=BRIGHT, bg=CARD,
-                 anchor="w").pack(fill="x", pady=(8, 0))
-        w, h = res.wh[k]
-        tk.Label(cell, text=f"{w}×{h}  ·  {t.size(self.size_of(k))}", font=tkfont(T_SMALL, s=s), fg=MUTED,
-                 bg=CARD, anchor="w").pack(fill="x", pady=(1, 0))
-        checkbox(cell, t("remove"), self.checks[k], size=18, fsize=T_HINT).pack(anchor="w", pady=(8, 0))
+        cv.create_text(x, y + h + P(10), anchor="nw", text=name, fill=BRIGHT, font=tkfont(T_HINT, "medium", s=s))
+        pw, ph = res.wh[k]
+        cv.create_text(x, y + h + P(36), anchor="nw", text=f"{pw}×{ph}  ·  {t.size(self.size_of(k))}", fill=MUTED,
+                       font=tkfont(T_SMALL, s=s))
+        chk = ("chk", f"k{k}")
+        it["chk"] = cv.create_image(x, y + h + P(68), anchor="nw", tags=chk)
+        cv.create_text(x + P(26), y + h + P(77), anchor="w", text=t("remove"), fill=TEXT,
+                       font=tkfont(T_HINT, s=s), tags=chk)
         self._paint_tile(k)
-        return cell
+        self._request_thumb(p, k, s)
 
-    def _request_thumb(self, lbl, p: Path, k: int):
-        key = str(p)
+    def _tile_k(self):
+        for tag in self.results.canvas.gettags("current"):
+            if tag[:1] == "k" and tag[1:].isdigit():
+                return int(tag[1:])
+        return None
+
+    def _tile_click(self, _e):
+        it = self._tiles.get(self._tile_k())
+        if it:
+            Preview(self, it["g"], it["pos"])
+
+    def _tile_hover(self, on: bool):
+        self.results.canvas.configure(cursor="hand2" if on else "")
+        old, self._hover_k = self._hover_k, (self._tile_k() if on else None)
+        for k in {old, self._hover_k} - {None}:
+            self._paint_tile(k)
+
+    def _chk_click(self, _e):
+        v = self.checks.get(self._tile_k())
+        if v is not None:
+            v.set(not v.get())
+
+    def _request_thumb(self, p: Path, k: int, s: float):
+        key = (str(p), s)
         if key in self._thumb_cache:
-            self._set_thumb(lbl, self._thumb_cache[key], k)
+            self._set_thumb(k, self._thumb_cache[key])
             return
         rid = self._render_id
+        box = (round(TW * s), round((TH - 12) * s))
 
         def job():
             try:
-                im = _thumb_pair(load_image(p, TW * 2))
+                pair = _thumb_pair(load_image(p, max(TW * 2, box[0])), box)
             except Exception:
-                im = None
-            if im is not None:
+                pair = None
+            if pair is not None:
                 if len(self._thumb_cache) > 600:
                     self._thumb_cache.clear()
-                self._thumb_cache[key] = im
-            self.q.put(("thumb", rid, lbl, im, k))
+                self._thumb_cache[key] = pair
+            self.q.put(("thumb", rid, k, pair))
 
         self._pool.submit(job)
 
-    def _set_thumb(self, lbl, im, k):
-        if im is None:
-            lbl.configure(text=self.t("no_preview"), text_color=MUTED, font=F(T_SMALL))
+    def _set_thumb(self, k, pair):
+        cv, it = self.results.canvas, self._tiles[k]
+        if pair is None:
+            x, y = cv.coords(it["thumb"])
+            cv.create_text(x, y, text=self.t("no_preview"), fill=MUTED, tags=("tile", f"k{k}"),
+                           font=tkfont(T_SMALL, s=self.results._get_widget_scaling()))
             return
-        im, dim, size = im
-        pair = (ctk.CTkImage(light_image=im, dark_image=im, size=size),
-                ctk.CTkImage(light_image=dim, dark_image=dim, size=size))
-        self._thumb_imgs.extend(pair)
-        self._tile_imgs[k] = pair
+        self._thumbs[k] = (ImageTk.PhotoImage(pair[0]), ImageTk.PhotoImage(pair[1]))
         self._paint_tile(k)
 
     # ---------------------------------------------------------- перенос и удаление
