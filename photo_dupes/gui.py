@@ -20,7 +20,7 @@ from .i18n import LANGS, Tr, default_lang, load_settings, save_settings
 
 # ------------------------------------------------------------------ цвета (как в globals.scss у Hydra)
 # Всё чёрно-белое: важные кнопки залиты белым, а состояние плитки видно по рамке и яркости
-# (белая рамка — оригинал, затемнённая картинка — пойдёт в дубли), без цветных акцентов.
+# (белая рамка — файл остаётся, затемнённая картинка — пойдёт в дубли), без цветных акцентов.
 BG = "#121212"          # фон основной области
 SIDE = "#0d0d0d"        # левая панель, заголовок окна, полосы
 CARD = "#171717"        # карточка группы
@@ -469,7 +469,6 @@ class App(ctk.CTk):
         self.scan_folder: Path | None = None
         self.groups: list[list[int]] = []
         self.checks: dict[int, ctk.BooleanVar] = {}
-        self.orig_set: set[int] = set()
         self._bulk = False
         self.sel_mode = "dupes"
         self._note_mode = None
@@ -929,7 +928,6 @@ class App(ctk.CTk):
         if not self.res:
             return
         self.groups = core.group(self.res, round(self.threshold.get(), 3))
-        self.orig_set = {g[0] for g in self.groups}
         self.checks = {}
         for g in self.groups:
             for k in g:
@@ -982,7 +980,7 @@ class App(ctk.CTk):
         return v is not None and v.get()
 
     def _paint_tile(self, k):
-        # белая рамка — оригинал; затемнение и значок корзины — файл пойдёт в дубли
+        # белая рамка — файл остаётся; затемнение и значок корзины — файл пойдёт в дубли
         tl = self._tiles.get(k)
         if tl is None or not tl.winfo_exists():
             return
@@ -1011,7 +1009,9 @@ class App(ctk.CTk):
         self._update_controls()
 
     def _tile_color(self, k, hover=False):
-        if k in self.orig_set and not self._marked(k):
+        # белая рамка у всех файлов, которые остаются, а не только у оригинала:
+        # после «Старые»/«Новые» сразу видно, что именно останется в папке
+        if not self._marked(k):
             return ACCENT
         return BORDER_HI if hover else TILE
 
