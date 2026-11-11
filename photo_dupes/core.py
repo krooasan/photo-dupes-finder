@@ -1,14 +1,16 @@
 """
-Everything except the window: find images, turn each one into an SSCD "fingerprint"
-(512 numbers) with ONNX Runtime, compare fingerprints, group copies, pick the original,
-move / delete. No torch needed at runtime.
+Всё, кроме окна: ищем картинки и видео, превращаем каждую в «отпечаток» SSCD (512 чисел)
+через ONNX Runtime, сравниваем отпечатки, собираем группы копий, выбираем оригинал,
+переносим / удаляем. Torch для работы не нужен.
 """
 from __future__ import annotations
 
 import csv
 import os
 import shutil
+import stat
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -18,34 +20,40 @@ from typing import Callable
 import numpy as np
 from PIL import Image, ImageOps
 
-try:  # HEIC from iPhones; without the package those files are just skipped
+try:  # HEIC с айфонов; без пакета такие файлы просто не откроются и попадут в ошибки
     from pillow_heif import register_heif_opener
 
     register_heif_opener()
 except ImportError:
     pass
 
-Image.MAX_IMAGE_PIXELS = None
+Image.MAX_IMAGE_PIXELS = None  # огромные панорамы и длинные скриншоты тоже открываем
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif"}
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".3gp", ".wmv"}
 EXTS = IMAGE_EXTS | VIDEO_EXTS
-# frames taken from a video, evenly spread over its length: one per 5 s, but 8..32
+# сколько кадров берём из видео: по одному на 5 секунд, но от 8 до 32
 VIDEO_FRAMES_MIN, VIDEO_FRAMES_MAX, VIDEO_SEC_PER_FRAME = 8, 32, 5
 DUP_DIR_NAME = "Дубли"
 CACHE_NAME = ".photo_dupes_cache.npz"
 CACHE_VERSION = 2
 MODEL_NAME = "sscd_disc_mixup.onnx"
-PAIR_FLOOR = 0.55  # store pairs above this; the threshold slider works without recompute
-BARS_RATIO = 0.9
+PAIR_FLOOR = 0.6   # ниже ползунок не опускается, поэтому более слабые пары не храним
+TOP_K = 64         # сколько самых похожих соседей помним для каждого файла
+BARS_RATIO = 0.9   # если реальная картинка занимает меньше 90% кадра — значит, есть рамки/полосы
+MAX_SIDE = 1728    # длинная сторона входа в модель; иначе скриншот 1080×30000 не влезет в видеопамять
+CHUNK = 64         # сколько файлов декодируем за раз (иначе готовые картинки копятся в памяти)
+# Декодер видео (особенно 4K) сам держит сотни мегабайт буферов. 8 таких одновременно — это 3,5 ГБ,
+# поэтому видео читаем не больше чем по два за раз; фото по-прежнему идут во все потоки.
+_video_slots = threading.Semaphore(2)
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
 STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
 
-Progress = Callable[[str, int, int], None]  # (stage, done, total)
+Progress = Callable[[str, int, int], None]  # (этап, сделано, всего)
 
 
 def resource_dir() -> Path:
-    """Folder with bundled files (PyInstaller) or the project root."""
+    """Папка с файлами программы: внутри exe (PyInstaller) или корень проекта."""
     if getattr(sys, "frozen", False):
         return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
     return Path(__file__).resolve().parent.parent
@@ -61,24 +69,44 @@ def find_model() -> Path:
         f"(или выполните tools/export_onnx.py).")
 
 
-# ----------------------------------------------------------------------------- files
+# ----------------------------------------------------------------------------- файлы
+def _hidden(st: os.stat_result, name: str) -> bool:
+    attrs = getattr(st, "st_file_attributes", 0)  # есть только на Windows
+    return name.startswith(".") or bool(attrs & (stat.FILE_ATTRIBUTE_HIDDEN | stat.FILE_ATTRIBUTE_SYSTEM))
+
+
 def collect_files(folder: Path, recursive: bool) -> list[Path]:
-    it = folder.rglob("*") if recursive else folder.iterdir()
+    """Все фото и видео в папке. Скрытые и системные файлы, пустые файлы, Корзину
+    ($RECYCLE.BIN), «System Volume Information» и нашу папку «Дубли» пропускаем."""
     out = []
-    for p in it:
-        try:
-            if not p.is_file() or p.name.startswith("._") or p.suffix.lower() not in EXTS:
+    # onerror=None: папки без доступа просто молча пропускаются, а не роняют поиск
+    for root, dirs, names in os.walk(folder, onerror=None):
+        if recursive:
+            dirs[:] = [d for d in dirs if not (d.startswith((".", "$")) or d == DUP_DIR_NAME
+                                               or d == "System Volume Information")]
+        else:
+            dirs[:] = []
+        for name in names:
+            if Path(name).suffix.lower() not in EXTS:
                 continue
-            if DUP_DIR_NAME in p.relative_to(folder).parts:
+            p = Path(root) / name
+            try:
+                st = p.stat()
+            except OSError:  # файл удалили прямо во время обхода или нет доступа
                 continue
-        except OSError:
-            continue
-        out.append(p)
+            if st.st_size == 0 or _hidden(st, name):
+                continue
+            out.append(p)
     return sorted(out)
 
 
-def file_sig(p: Path) -> tuple[int, int]:
-    st = p.stat()
+def file_sig(p: Path) -> tuple[int, int] | None:
+    """(время изменения, размер) — по ним понимаем, что файл не менялся и можно взять из кэша.
+    None, если файла уже нет."""
+    try:
+        st = p.stat()
+    except OSError:
+        return None
     return st.st_mtime_ns, st.st_size
 
 
@@ -87,16 +115,18 @@ def is_video(p: Path) -> bool:
 
 
 def video_frames(p: Path, n: int | None = None) -> tuple[list[Image.Image], int, int]:
-    """n frames spread over the video (skipping the very start/end, often black), and its size."""
-    import cv2  # imported lazily: only needed when the folder has videos
+    """n кадров, равномерно по всему видео (самое начало и конец пропускаем — там часто
+    чёрный экран), плюс размер видео."""
+    os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")  # не сыпать в консоль ругань на битые видео
+    import cv2  # грузим только если в папке есть видео, библиотека тяжёлая
 
     cap = cv2.VideoCapture(str(p))
     try:
         if not cap.isOpened():
-            raise ValueError("cannot open video")
+            raise ValueError("не удалось открыть видео")
         w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if n is None:  # more frames for longer videos, so a short trimmed copy still overlaps enough
+        if n is None:  # длиннее видео — больше кадров, чтобы обрезанная копия всё равно совпала
             fps = cap.get(cv2.CAP_PROP_FPS) or 25
             n = int(min(VIDEO_FRAMES_MAX, max(VIDEO_FRAMES_MIN, count / fps / VIDEO_SEC_PER_FRAME)))
         positions = [int(count * (i + 1) / (n + 1)) for i in range(n)] if count > n else [None]
@@ -106,23 +136,29 @@ def video_frames(p: Path, n: int | None = None) -> tuple[list[Image.Image], int,
                 cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
             ok, f = cap.read()
             if ok:
+                # Сразу уменьшаем: 32 кадра 4K — это ~800 МБ, а таких видео декодируется 8 одновременно
+                # (так однажды улетело 6 ГБ памяти). Модели всё равно нужно только 288 px.
+                short = min(f.shape[:2])
+                if short > 576:
+                    k = 576 / short
+                    f = cv2.resize(f, (round(f.shape[1] * k), round(f.shape[0] * k)), interpolation=cv2.INTER_AREA)
                 frames.append(Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)))
         if not frames:
-            raise ValueError("no readable frames")
+            raise ValueError("в видео нет читаемых кадров")
         return frames, w, h
     finally:
         cap.release()
 
 
 def open_picture(p: Path, max_side: int | None = None) -> Image.Image:
-    """RGB picture of a file: the image itself, or the middle frame of a video."""
+    """Картинка файла в RGB: сама фотка или средний кадр видео."""
     if is_video(p):
         frames, _, _ = video_frames(p, 1)
         im = frames[0]
     else:
         with Image.open(p) as src:
             if max_side:
-                src.draft("RGB", (max_side, max_side))  # JPEG: decode at reduced size, much faster
+                src.draft("RGB", (max_side, max_side))  # JPEG сразу декодируется уменьшенным — сильно быстрее
             im = ImageOps.exif_transpose(src).convert("RGB")
     if max_side:
         im.thumbnail((max_side, max_side), Image.LANCZOS)
@@ -130,11 +166,11 @@ def open_picture(p: Path, max_side: int | None = None) -> Image.Image:
 
 
 def _to_input(im: Image.Image) -> np.ndarray:
-    """Picture -> model input.
+    """Картинка -> вход модели.
 
-    Must match what SSCD saw in training (torchvision Resize(288) + Normalize), otherwise
-    fingerprints drift. Checked against torchvision: the arrays are identical.
-    Note: only the short side becomes 288, so different aspect ratios give different shapes.
+    Должно в точности совпадать с тем, на чём учили SSCD (torchvision Resize(288) + Normalize),
+    иначе отпечатки «поплывут». Проверял против torchvision — массивы совпадают байт в байт.
+    Короткая сторона становится 288, поэтому у картинок с разными пропорциями разный размер.
     """
     iw, ih = im.size
     s = 288
@@ -142,21 +178,27 @@ def _to_input(im: Image.Image) -> np.ndarray:
         nw, nh = s, int(s * ih / iw)
     else:
         nw, nh = int(s * iw / ih), s
+    if max(nw, nh) > MAX_SIDE:  # очень длинный скриншот: ужимаем, чтобы не съесть всю видеопамять
+        k = MAX_SIDE / max(nw, nh)
+        nw, nh = max(1, int(nw * k)), max(1, int(nh * k))
     a = np.asarray(im.resize((nw, nh), Image.BILINEAR), dtype=np.float32) / 255.0
     return ((a.transpose(2, 0, 1) - MEAN) / STD).astype(np.float32)
 
 
 def preprocess(p: Path):
-    """Model input for a file: (3, H, W) for an image, (frames, 3, H, W) for a video."""
+    """Всё, что нужно от файла для поиска: вход модели ((3, H, W) для фото,
+    (кадры, 3, H, W) для видео), размер и доля «реальной» картинки без рамок."""
     if is_video(p):
-        frames, w, h = video_frames(p)
-        return np.stack([_to_input(f) for f in frames]), w, h
+        with _video_slots:
+            frames, w, h = video_frames(p)
+        return np.stack([_to_input(f) for f in frames]), w, h, content_ratio(frames[len(frames) // 2])
     with Image.open(p) as im:
         w, h = im.size
-        return _to_input(ImageOps.exif_transpose(im).convert("RGB")), w, h
+        rgb = ImageOps.exif_transpose(im).convert("RGB")
+    return _to_input(rgb), w, h, content_ratio(rgb)
 
 
-# ----------------------------------------------------------------------------- cache
+# ----------------------------------------------------------------------------- кэш
 def load_cache(path: Path) -> dict:
     if not path.exists():
         return {}
@@ -164,10 +206,12 @@ def load_cache(path: Path) -> dict:
         with np.load(path, allow_pickle=False) as d:
             if int(d["version"]) != CACHE_VERSION:
                 return {}
+            # ratio появился позже: в старых кэшах его нет, тогда досчитаем при поиске
+            ratios = d["ratio"] if "ratio" in d.files else np.full(len(d["paths"]), np.nan)
             return {str(p): {"sig": (int(s[0]), int(s[1])), "w": int(wh[0]), "h": int(wh[1]),
-                             "emb": e.astype(np.float32)}
-                    for p, s, wh, e in zip(d["paths"], d["sigs"], d["wh"], d["emb"])}
-    except Exception:
+                             "emb": e.astype(np.float32), "ratio": float(r)}
+                    for p, s, wh, e, r in zip(d["paths"], d["sigs"], d["wh"], d["emb"], ratios)}
+    except Exception:  # битый кэш — не страшно, просто посчитаем заново
         return {}
 
 
@@ -176,29 +220,33 @@ def save_cache(path: Path, items: dict):
         return
     keys = list(items)
     tmp = path.with_name(path.name + ".tmp.npz")
-    np.savez(tmp, version=np.array(CACHE_VERSION),
-             paths=np.array(keys, dtype=str),
-             sigs=np.array([items[k]["sig"] for k in keys], dtype=np.int64),
-             wh=np.array([(items[k]["w"], items[k]["h"]) for k in keys], dtype=np.int64),
-             emb=np.stack([items[k]["emb"] for k in keys]).astype(np.float32))
-    os.replace(tmp, path)
+    try:
+        np.savez(tmp, version=np.array(CACHE_VERSION),
+                 paths=np.array(keys, dtype=str),
+                 sigs=np.array([items[k]["sig"] for k in keys], dtype=np.int64),
+                 wh=np.array([(items[k]["w"], items[k]["h"]) for k in keys], dtype=np.int64),
+                 emb=np.stack([items[k]["emb"] for k in keys]).astype(np.float32),
+                 ratio=np.array([items[k].get("ratio", np.nan) for k in keys], dtype=np.float32))
+        os.replace(tmp, path)  # пишем во временный файл и подменяем — так кэш не побьётся при вылете
+    except OSError:  # папка только для чтения и т.п. — работаем без кэша
+        return
     if os.name == "nt":
-        try:  # hide the cache file in Explorer
+        try:  # прячем кэш, чтобы не мозолил глаза в Проводнике
             import ctypes
             ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x2)
         except Exception:
             pass
 
 
-# ----------------------------------------------------------------------------- model
+# ----------------------------------------------------------------------------- модель
 class Embedder:
     def __init__(self, use_gpu: bool = True):
         import onnxruntime as ort
 
         so = ort.SessionOptions()
         so.log_severity_level = 3
-        # DirectML runs on any DX12 GPU (NVIDIA / AMD / Intel). It doesn't support memory
-        # patterns or parallel execution, onnxruntime docs ask to turn both off.
+        # DirectML работает на любой видеокарте с DX12 (NVIDIA / AMD / Intel). Он не умеет
+        # memory pattern и параллельное выполнение — в доке onnxruntime просят их выключить.
         providers = ["CPUExecutionProvider"]
         if use_gpu and "DmlExecutionProvider" in ort.get_available_providers():
             so.enable_mem_pattern = False
@@ -206,7 +254,7 @@ class Embedder:
             providers = ["DmlExecutionProvider", "CPUExecutionProvider"]
         try:
             self.sess = ort.InferenceSession(str(find_model()), so, providers=providers)
-        except Exception:  # broken GPU driver etc. -> just fall back to CPU
+        except Exception:  # кривой драйвер видеокарты и т.п. — откатываемся на процессор
             if providers[0] == "CPUExecutionProvider":
                 raise
             self.sess = ort.InferenceSession(str(find_model()), so, providers=["CPUExecutionProvider"])
@@ -217,20 +265,27 @@ class Embedder:
         return e / np.maximum(np.linalg.norm(e, axis=1, keepdims=True), 1e-12)
 
 
-# ----------------------------------------------------------------------------- scan
+# ----------------------------------------------------------------------------- поиск
 @dataclass
 class ScanResult:
     files: list[Path]
-    wh: np.ndarray                      # (n, 2)
-    pairs: dict[tuple[int, int], float]  # i<j -> cosine, only >= PAIR_FLOOR
+    wh: np.ndarray       # (n, 2) ширина и высота
+    emb: np.ndarray      # (n, 512) отпечатки, длина каждого = 1
+    ratio: np.ndarray    # (n,) доля кадра без рамок и полос
+    size: np.ndarray     # (n,) размер файла в байтах
+    mtime: np.ndarray    # (n,) время изменения, секунды
+    # похожие пары тремя массивами: i < j и их сходство. Массивы, а не словарь {(i, j): s} —
+    # словарь Python на сотнях тысяч пар весит в десятки раз больше.
+    pair_i: np.ndarray
+    pair_j: np.ndarray
+    pair_s: np.ndarray
     errors: list[tuple[Path, str]] = field(default_factory=list)
     device: str = ""
     seconds: float = 0.0
 
     def sim(self, a: int, b: int) -> float:
-        if a == b:
-            return 1.0
-        return self.pairs.get((a, b) if a < b else (b, a), 0.0)
+        # отпечатки нормированы, поэтому скалярное произведение = косинусное сходство
+        return 1.0 if a == b else float(self.emb[a] @ self.emb[b])
 
 
 def scan(folder: Path, recursive: bool, progress: Progress, cancel: Callable[[], bool],
@@ -240,7 +295,9 @@ def scan(folder: Path, recursive: bool, progress: Progress, cancel: Callable[[],
     files = collect_files(folder, recursive)
     cache_path = folder / CACHE_NAME
     cache = load_cache(cache_path)
-    todo = [p for p in files if (c := cache.get(str(p))) is None or c["sig"] != file_sig(p)]
+    sigs = {p: file_sig(p) for p in files}
+    todo = [p for p in files if sigs[p] is not None
+            and ((c := cache.get(str(p))) is None or c["sig"] != sigs[p])]
 
     errors: list[tuple[Path, str]] = []
     device = "cache"
@@ -248,51 +305,70 @@ def scan(folder: Path, recursive: bool, progress: Progress, cancel: Callable[[],
         progress("model", 0, len(todo))
         emb = Embedder(use_gpu)
         device = emb.device
-        # A batch has to be one shape, but images keep their aspect ratio after preprocess.
-        # So we collect images into buckets by shape and run a bucket once it has 16 items
-        # (screenshots from one monitor all share a shape, so most batches are full).
+        # В одну пачку для модели можно сложить только картинки одного размера, а после
+        # preprocess у них разные пропорции. Поэтому раскладываем по «корзинам» по размеру
+        # и запускаем корзину, когда в ней набралось 16 штук (скриншоты с одного монитора
+        # все одного размера, так что пачки почти всегда полные).
         buckets: dict[tuple, list] = {}
         done = 0
         last_save = time.time()
 
+        def put(p, w, h, ratio, e):
+            cache[str(p)] = {"sig": sigs[p], "w": w, "h": h, "emb": e, "ratio": ratio}
+
         def flush(key):
             nonlocal done
             items = buckets.pop(key)
-            out = emb(np.stack([it[1] for it in items]))
-            for (p, _, w, h), e in zip(items, out):
-                cache[str(p)] = {"sig": file_sig(p), "w": w, "h": h, "emb": e}
+            try:
+                out = emb(np.stack([it[1] for it in items]))
+                for (p, _, w, h, r), e in zip(items, out):
+                    put(p, w, h, r, e)
+            except Exception:
+                # пачка не прошла (например, не хватило видеопамяти) — пробуем по одному,
+                # чтобы один кривой файл не утянул за собой всю пачку
+                for p, arr, w, h, r in items:
+                    try:
+                        put(p, w, h, r, emb(arr[None])[0])
+                    except Exception as ex:
+                        errors.append((p, f"{type(ex).__name__}: {ex}"))
             done += len(items)
 
         def load(p):
             try:
                 return p, *preprocess(p), ""
-            except Exception as e:
-                return p, None, 0, 0, f"{type(e).__name__}: {e}"
+            except Exception as e:  # битый файл, обрезанная загрузка и т.п. — пропускаем, не падаем
+                return p, None, 0, 0, 1.0, f"{type(e).__name__}: {e}"
 
-        # decoding PNG/JPEG is the slow part, so it runs in threads while the GPU works
+        # Декодирование PNG/JPEG — самое медленное, поэтому идёт в потоках, пока видеокарта считает.
+        # Файлы отдаём порциями по CHUNK: если отдать все сразу, потоки декодируют быстрее,
+        # чем считает модель, и готовые картинки (~1,7 МБ каждая) копятся в памяти гигабайтами.
         with ThreadPoolExecutor(max_workers=max(2, min(8, (os.cpu_count() or 4)))) as pool:
-            for p, arr, w, h, err in pool.map(load, todo):
+            for c0 in range(0, len(todo), CHUNK):
                 if cancel():
                     break
-                if err:
-                    errors.append((p, err))
-                    done += 1
-                elif arr.ndim == 4:
-                    # video: its frames form one batch; the video's fingerprint is their average,
-                    # so a re-encoded / trimmed copy still lands close to the original
-                    e = emb(arr).mean(axis=0)
-                    cache[str(p)] = {"sig": file_sig(p), "w": w, "h": h, "emb": e / max(np.linalg.norm(e), 1e-12)}
-                    done += 1
-                else:
-                    key = arr.shape
-                    buckets.setdefault(key, []).append((p, arr, w, h))
-                    if len(buckets[key]) >= batch_size:
-                        flush(key)
-                    elif sum(len(v) for v in buckets.values()) > 4 * batch_size:
-                        # many odd shapes: don't hold them all in memory, run the biggest bucket
-                        flush(max(buckets, key=lambda k: len(buckets[k])))
+                for p, arr, w, h, ratio, err in pool.map(load, todo[c0:c0 + CHUNK]):
+                    if err:
+                        errors.append((p, err))
+                        done += 1
+                    elif arr.ndim == 4:
+                        # видео: все кадры — одна пачка, отпечаток видео — их среднее.
+                        # Так пересжатая или обрезанная по времени копия всё равно оказывается рядом.
+                        try:
+                            e = emb(arr).mean(axis=0)
+                            put(p, w, h, ratio, e / max(np.linalg.norm(e), 1e-12))
+                        except Exception as ex:
+                            errors.append((p, f"{type(ex).__name__}: {ex}"))
+                        done += 1
+                    else:
+                        key = arr.shape
+                        buckets.setdefault(key, []).append((p, arr, w, h, ratio))
+                        if len(buckets[key]) >= batch_size:
+                            flush(key)
+                        elif sum(len(v) for v in buckets.values()) > 4 * batch_size:
+                            # много картинок разных размеров: не держим их все, запускаем самую полную корзину
+                            flush(max(buckets, key=lambda k: len(buckets[k])))
                 progress("analyze", done, len(todo))
-                if time.time() - last_save > 30:  # so Stop / a crash doesn't lose the work
+                if time.time() - last_save > 30:  # чтобы «Стоп» или вылет не обнулили работу
                     save_cache(cache_path, cache)
                     last_save = time.time()
             for key in list(buckets):
@@ -304,30 +380,73 @@ def scan(folder: Path, recursive: bool, progress: Progress, cancel: Callable[[],
         if cancel():
             raise InterruptedError
 
-    files = [p for p in files if str(p) in cache and cache[str(p)]["sig"] == file_sig(p)]
+    files = [p for p in files if sigs[p] is not None and str(p) in cache and cache[str(p)]["sig"] == sigs[p]]
     n = len(files)
-    wh = np.array([(cache[str(p)]["w"], cache[str(p)]["h"]) for p in files], dtype=np.int64).reshape(-1, 2)
-    pairs: dict[tuple[int, int], float] = {}
-    if n > 1:
-        E = np.stack([cache[str(p)]["emb"] for p in files])
-        # Fingerprints are L2-normalised, so a dot product is the cosine similarity.
-        # A full n×n matrix would be 10 GB for 50k photos, so we go in blocks of rows
-        # and keep only pairs above PAIR_FLOOR.
-        step = 2048
-        for s in range(0, n, step):
-            progress("compare", s, n)
-            S = E[s:s + step] @ E.T
-            ii, jj = np.nonzero(S >= PAIR_FLOOR)
-            for a, b in zip(ii, jj):
-                i, j = s + int(a), int(b)
-                if i < j:
-                    pairs[(i, j)] = float(S[a, b])
-    return ScanResult(files, wh, pairs, errors, device, time.time() - t0)
+    items = [cache[str(p)] for p in files]
+    E = np.stack([c["emb"] for c in items]).astype(np.float32) if n else np.zeros((0, 512), np.float32)
+    pi, pj, ps = _similar_pairs(E, progress)
+
+    # В старых кэшах нет ratio. Досчитываем только для файлов, у которых вообще есть пары, —
+    # остальным оригинал выбирать не придётся.
+    ratio = np.array([c.get("ratio", np.nan) for c in items], dtype=np.float32)
+    need = np.unique(np.concatenate([pi, pj]))
+    need = need[np.isnan(ratio[need])] if len(need) else need
+    if len(need):
+        for k in need:
+            try:
+                ratio[k] = content_ratio(open_picture(files[k], 512))
+            except Exception:
+                ratio[k] = 1.0
+            cache[str(files[k])]["ratio"] = float(ratio[k])
+        save_cache(cache_path, cache)
+    ratio = np.nan_to_num(ratio, nan=1.0)
+
+    return ScanResult(
+        files=files,
+        wh=np.array([(c["w"], c["h"]) for c in items], dtype=np.int64).reshape(-1, 2),
+        emb=E, ratio=ratio,
+        size=np.array([c["sig"][1] for c in items], dtype=np.int64),
+        mtime=np.array([c["sig"][0] / 1e9 for c in items], dtype=np.float64),
+        pair_i=pi, pair_j=pj, pair_s=ps,
+        errors=errors, device=device, seconds=time.time() - t0)
 
 
-# ----------------------------------------------------------------------------- original choice
+def _similar_pairs(E: np.ndarray, progress: Progress):
+    """Похожие пары: для каждого файла — до TOP_K самых похожих соседей со сходством >= PAIR_FLOOR.
+
+    Полная матрица n×n на 50 000 фото — это 10 ГБ, поэтому считаем полосами строк и сразу
+    выкидываем лишнее. Хранить все пары выше порога нельзя: в папке из 10 000 однотипных
+    скриншотов их 50 миллионов (проверял — 2,2 ГБ памяти). Для групп хватает ближайших соседей:
+    копии одного снимка всегда друг у друга в топе.
+    """
+    n = len(E)
+    if n < 2:
+        return np.zeros(0, np.int32), np.zeros(0, np.int32), np.zeros(0, np.float32)
+    k = min(TOP_K, n - 1)
+    step = max(256, min(2048, 50_000_000 // n))  # полоса матрицы не больше ~200 МБ
+    out_i, out_j, out_s = [], [], []
+    for s in range(0, n, step):
+        progress("compare", s, n)
+        S = E[s:s + step] @ E.T
+        rows = np.arange(len(S))
+        S[rows, rows + s] = -1  # сам с собой не пара
+        nb = np.argpartition(-S, k - 1, axis=1)[:, :k]  # k ближайших без полной сортировки
+        sim = np.take_along_axis(S, nb, axis=1)
+        keep = sim >= PAIR_FLOOR
+        i = np.broadcast_to(rows[:, None] + s, nb.shape)[keep]
+        j = nb[keep]
+        out_i.append(np.minimum(i, j).astype(np.int32))
+        out_j.append(np.maximum(i, j).astype(np.int32))
+        out_s.append(sim[keep].astype(np.float32))
+    i, j, sim = np.concatenate(out_i), np.concatenate(out_j), np.concatenate(out_s)
+    # пара A-B могла найтись и у A, и у B — оставляем одну
+    _, first = np.unique(i.astype(np.int64) * n + j, return_index=True)
+    return i[first], j[first], sim[first]
+
+
+# ----------------------------------------------------------------------------- выбор оригинала
 def _largest_run(mask: np.ndarray):
-    """(start, end) of the longest run of True values."""
+    """(начало, конец) самой длинной подряд идущей серии True."""
     best, start, se = 0, None, (0, len(mask))
     for i, v in enumerate(list(mask) + [False]):
         if v and start is None:
@@ -340,94 +459,86 @@ def _largest_run(mask: np.ndarray):
 
 
 def _bar_lines(a: np.ndarray, axis: int) -> np.ndarray:
-    """Rows/columns that look like a bar: almost one colour and very dark or very light
-    (black letterbox, dark app UI, white page around a picture). Thresholds are hand-tuned."""
+    """Строки/столбцы, похожие на полосу: почти однотонные и очень тёмные или очень светлые
+    (чёрные поля, тёмный интерфейс приложения, белая страница вокруг фото). Пороги подобраны на глаз."""
     mean, std = a.mean(axis=axis), a.std(axis=axis)
     return (std < 6) & ((mean < 45) | (mean > 240))
 
 
-_content_memo: dict[str, float] = {}
-
-
-def content_ratio(p: Path) -> float:
-    """Share of the frame that is real picture (without black/white bars and UI)."""
-    key = str(p)
-    if key in _content_memo:
-        return _content_memo[key]
-    ratio = 1.0
+def content_ratio(im: Image.Image) -> float:
+    """Какую долю кадра занимает реальная картинка (без чёрных/белых полос и интерфейса вокруг)."""
     try:
-        a = np.asarray(open_picture(p, 512).convert("L"), dtype=np.float32)
+        small = im.convert("L")
+        small.thumbnail((512, 512))
+        a = np.asarray(small, dtype=np.float32)
         r0, r1 = _largest_run(~_bar_lines(a, axis=1))
-        if r1 > r0:
-            c0, c1 = _largest_run(~_bar_lines(a[r0:r1], axis=0))
-            ratio = ((r1 - r0) * (c1 - c0)) / (a.shape[0] * a.shape[1])
+        if r1 <= r0:
+            return 1.0
+        c0, c1 = _largest_run(~_bar_lines(a[r0:r1], axis=0))
+        return ((r1 - r0) * (c1 - c0)) / (a.shape[0] * a.shape[1])
     except Exception:
-        pass
-    _content_memo[key] = ratio
-    return ratio
+        return 1.0
 
 
 def original_key(res: ScanResult, k: int):
-    """Sort key: the "best" copy of a group gets the biggest tuple. Compared in order:
-    no bars/frames -> more real picture pixels -> not a PNG (usually a screenshot) -> bigger file."""
-    p = res.files[k]
-    r = content_ratio(p)
+    """Ключ сортировки: у «лучшей» копии группы он самый большой. Сравниваем по очереди:
+    нет рамок/полос -> больше пикселей реальной картинки -> не PNG (обычно скриншот) -> файл больше."""
+    r = float(res.ratio[k])
     w, h = res.wh[k]
-    try:
-        size = p.stat().st_size
-    except OSError:
-        size = 0
-    return (r >= BARS_RATIO, round(r * int(w) * int(h)), p.suffix.lower() != ".png", size)
+    return (r >= BARS_RATIO, round(r * int(w) * int(h)), res.files[k].suffix.lower() != ".png", int(res.size[k]))
 
 
-class _UF:
-    """Union-find: merges files into groups through pairs (A~B and B~C -> one group)."""
+def _components(n: int, i: np.ndarray, j: np.ndarray) -> np.ndarray:
+    """Номер компоненты связности для каждого файла (A~B и B~C -> одна компонента).
 
-    def __init__(self, n):
-        self.p = list(range(n))
-
-    def find(self, a):
-        while self.p[a] != a:
-            self.p[a] = self.p[self.p[a]]
-            a = self.p[a]
-        return a
-
-    def union(self, a, b):
-        ra, rb = self.find(a), self.find(b)
-        if ra != rb:
-            self.p[rb] = ra
+    Обычный union-find в цикле Python на десятках миллионов пар идёт минутами, поэтому
+    делаем то же самое векторно: каждому узлу раз за разом присваиваем минимальную метку
+    среди соседей, пока метки не перестанут меняться.
+    """
+    labels = np.arange(n)
+    if len(i) == 0:
+        return labels
+    while True:
+        old = labels.copy()
+        m = np.minimum(labels[i], labels[j])
+        np.minimum.at(labels, i, m)
+        np.minimum.at(labels, j, m)
+        labels = labels[labels]  # «перепрыгиваем» по цепочке меток — сходится за несколько шагов
+        if np.array_equal(labels, old):
+            return labels
 
 
 def group(res: ScanResult, threshold: float) -> list[list[int]]:
-    """Groups of indices, original first, then by similarity to the original."""
+    """Группы индексов: сначала оригинал, потом остальные по убыванию сходства с ним."""
     n = len(res.files)
-    uf = _UF(n)
-    for (a, b), s in res.pairs.items():
-        if s >= threshold:
-            uf.union(a, b)
-    comps: dict[int, list[int]] = {}
-    for i in range(n):
-        comps.setdefault(uf.find(i), []).append(i)
+    keep = res.pair_s >= threshold
+    labels = _components(n, res.pair_i[keep], res.pair_j[keep])
+    order = np.argsort(labels, kind="stable")
+    splits = np.flatnonzero(np.diff(labels[order])) + 1
     out = []
-    for g in comps.values():
-        rest = g
-        # Union-find can chain: A~B, B~C, but A and C are different photos (two frames of a burst).
-        # So inside each component we keep only files close to the chosen original
-        # and regroup the leftovers the same way.
+    for comp in np.split(order, splits):
+        if len(comp) < 2:
+            continue
+        rest = comp
+        # Компоненты бывают цепочками: A~B, B~C, но A и C — разные фото (кадры одной серии).
+        # Поэтому внутри компоненты оставляем только тех, кто похож на выбранный оригинал,
+        # а остальных так же перегруппировываем между собой.
         while len(rest) > 1:
-            orig = max(rest, key=lambda k: original_key(res, k))
-            members = [k for k in rest if k == orig or res.sim(orig, k) >= threshold]
+            orig = max(rest, key=lambda k: original_key(res, int(k)))
+            sims = res.emb[rest] @ res.emb[orig]
+            close = (sims >= threshold) | (rest == orig)
+            members = rest[close]
             if len(members) > 1:
-                out.append([orig] + sorted((k for k in members if k != orig),
-                                           key=lambda k: -res.sim(orig, k)))
-            taken = set(members)
-            rest = [k for k in rest if k not in taken]
+                others = sorted((int(k) for k in members if k != orig), key=lambda k: -res.sim(int(orig), k))
+                out.append([int(orig)] + others)
+            rest = rest[~close]
     out.sort(key=len, reverse=True)
     return out
 
 
-# ----------------------------------------------------------------------------- actions
+# ----------------------------------------------------------------------------- действия
 def unique_dest(dest: Path) -> Path:
+    """Свободное имя: если файл уже есть, добавляем _1, _2…"""
     if not dest.exists():
         return dest
     k = 1
@@ -438,13 +549,13 @@ def unique_dest(dest: Path) -> Path:
 
 def apply(folder: Path, res: ScanResult, groups: list[list[int]], selected: set[int],
           mode: str) -> tuple[int, Path | None]:
-    """mode: 'move' -> <folder>/Дубли/group_NNNN/, 'trash' -> Recycle Bin.
-    Writes a CSV report. Returns (files processed, report path)."""
+    """mode: 'move' -> <папка>/Дубли/group_NNNN/, 'trash' -> Корзина.
+    Пишет отчёт CSV. Возвращает (сколько файлов обработано, путь к отчёту)."""
     stamp = time.strftime("%Y%m%d_%H%M%S")
     dup_root = folder / DUP_DIR_NAME
     rows, count = [], 0
     gnum = 1
-    if mode == "move" and dup_root.exists():
+    if mode == "move" and dup_root.exists():  # продолжаем нумерацию групп с прошлых переносов
         nums = [int(d.name[6:]) for d in dup_root.iterdir()
                 if d.is_dir() and d.name.startswith("group_") and d.name[6:].isdigit()]
         gnum = max(nums, default=0) + 1
@@ -460,6 +571,7 @@ def apply(folder: Path, res: ScanResult, groups: list[list[int]], selected: set[
         gdir = dup_root / gname
         if mode == "move":
             gdir.mkdir(parents=True, exist_ok=True)
+            # кладём рядом копию оригинала, чтобы в папке группы было с чем сравнить
             if orig not in selected and res.files[orig].exists():
                 shutil.copy2(res.files[orig], unique_dest(gdir / f"ORIGINAL_{res.files[orig].name}"))
         for k in g:
@@ -483,6 +595,7 @@ def apply(folder: Path, res: ScanResult, groups: list[list[int]], selected: set[
     report = None
     if rows:
         report = folder / f"dupes_report_{stamp}.csv"
+        # utf-8-sig — чтобы Excel правильно открыл кириллицу
         with open(report, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.DictWriter(f, fieldnames=list(rows[0]), delimiter=";")
             w.writeheader()
@@ -491,13 +604,14 @@ def apply(folder: Path, res: ScanResult, groups: list[list[int]], selected: set[
 
 
 def undo(folder: Path, report: Path) -> tuple[int, int]:
-    """Bring files back by a 'move' report; remove ORIGINAL_ copies."""
+    """Возвращает файлы на место по отчёту переноса и убирает копии ORIGINAL_."""
     with open(report, encoding="utf-8-sig", newline="") as f:
         rows = list(csv.DictReader(f, delimiter=";"))
     back = skipped = 0
     for r in rows:
         if r.get("moved_to"):
             src, dst = Path(r["moved_to"]), Path(r["file"])
+            # не затираем файл, если на старом месте уже лежит что-то другое
             if src.exists() and not dst.exists():
                 shutil.move(str(src), str(dst))
                 back += 1
@@ -509,6 +623,7 @@ def undo(folder: Path, report: Path) -> tuple[int, int]:
             continue
         orig, gdir = Path(r["file"]), dup_root / r["group"]
         c = gdir / f"ORIGINAL_{orig.name}"
+        # удаляем копию оригинала, только если сам оригинал на месте и это точно та же фотка
         if c.exists() and orig.exists() and c.stat().st_size == orig.stat().st_size:
             c.unlink()
         if gdir.is_dir() and not any(gdir.iterdir()):
