@@ -305,6 +305,7 @@ def scan(folder: Path, recursive: bool, progress: Progress, cancel: Callable[[],
         progress("model", 0, len(todo))
         emb = Embedder(use_gpu)
         device = emb.device
+        progress("analyze", 0, len(todo))
         # В одну пачку для модели можно сложить только картинки одного размера, а после
         # preprocess у них разные пропорции. Поэтому раскладываем по «корзинам» по размеру
         # и запускаем корзину, когда в ней набралось 16 штук (скриншоты с одного монитора
@@ -367,7 +368,9 @@ def scan(folder: Path, recursive: bool, progress: Progress, cancel: Callable[[],
                         elif sum(len(v) for v in buckets.values()) > 4 * batch_size:
                             # много картинок разных размеров: не держим их все, запускаем самую полную корзину
                             flush(max(buckets, key=lambda k: len(buckets[k])))
-                progress("analyze", done, len(todo))
+                    # счётчик двигаем после каждого файла: порция из 64 файлов с видео
+                    # может считаться 5-10 секунд, и без этого кажется, что всё зависло
+                    progress("analyze", done + sum(len(v) for v in buckets.values()), len(todo))
                 if time.time() - last_save > 30:  # чтобы «Стоп» или вылет не обнулили работу
                     save_cache(cache_path, cache)
                     last_save = time.time()
