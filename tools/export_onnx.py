@@ -1,8 +1,8 @@
 """
-Convert Meta SSCD (sscd_disc_mixup, TorchScript) to ONNX and check that the
-ONNX model gives the same embeddings as the original.
+Переводит модель Meta SSCD (sscd_disc_mixup, TorchScript) в ONNX и проверяет,
+что ONNX выдаёт те же векторы, что и оригинал.
 
-Needs torch (only for this one-time conversion, the app itself does not):
+torch нужен только здесь, один раз. Самой программе он не нужен:
     py -3.11 -m pip install torch onnx onnxruntime
     py -3.11 tools/export_onnx.py
 """
@@ -34,7 +34,7 @@ def main():
     )
     print(f"saved {OUT} ({OUT.stat().st_size / 1e6:.1f} MB)")
 
-    # check: several shapes and batch sizes, cosine similarity torch vs onnx
+    # сверяем на разных размерах и пачках: косинус между выходом torch и onnx должен быть ~1
     sess = ort.InferenceSession(str(OUT), providers=["CPUExecutionProvider"])
     worst = 1.0
     with torch.inference_mode():

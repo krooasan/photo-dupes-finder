@@ -1,4 +1,4 @@
-# Push a tag like v1.0.0 -> builds the Windows app and attaches the zip to a GitHub Release.
+# Пушишь тег вида v1.0.0 — собирается exe, и zip прикрепляется к релизу на GitHub.
 name: release
 
 on:

@@ -1,6 +1,6 @@
 @echo off
-rem Builds dist\PhotoDupesFinder\ and dist\PhotoDupesFinder-win64.zip
-rem Needs Python 3.11+ and models\sscd_disc_mixup.onnx (see tools\export_onnx.py)
+rem Собирает dist\PhotoDupesFinder\ и dist\PhotoDupesFinder-win64.zip
+rem Нужны Python 3.11 и models\sscd_disc_mixup.onnx (см. tools\export_onnx.py)
 setlocal
 cd /d "%~dp0"
 

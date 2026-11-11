@@ -1,4 +1,4 @@
-"""UI strings (ru / en) and user settings."""
+"""Строки интерфейса (ru / en) и настройки пользователя."""
 from __future__ import annotations
 
 import json
@@ -264,7 +264,7 @@ class Tr:
         return v.format(**kw) if kw and isinstance(v, str) else v
 
     def n(self, key: str, n: int, **kw) -> str:
-        """Plural form: ru -> (one, few, many), en -> (one, other)."""
+        # русский: (файл, файла, файлов), английский: (file, files)
         forms = S[self.lang][key]
         if self.lang == "ru":
             n10, n100 = n % 10, n % 100
@@ -283,7 +283,7 @@ class Tr:
         return ""
 
 
-# ------------------------------------------------------------------ settings
+# ------------------------------------------------------------------ настройки
 def _settings_path() -> Path:
     base = Path(os.environ.get("APPDATA", Path.home())) / "PhotoDupesFinder"
     return base / "settings.json"
