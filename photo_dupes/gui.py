@@ -1,4 +1,4 @@
-"""GUI (CustomTkinter) for Photo Dupes Finder, styled after the Hydra launcher."""
+"""Окно программы на CustomTkinter. Внешний вид подсмотрен у лаунчера Hydra."""
 from __future__ import annotations
 
 import ctypes
@@ -18,29 +18,29 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageOps
 from . import __version__, core
 from .i18n import LANGS, Tr, default_lang, load_settings, save_settings
 
-# ------------------------------------------------------------------ tokens (Hydra's globals.scss)
-# Monochrome: white fills carry the important actions; state is shown by shape and
-# brightness (white frame = original, dimmed = marked), never by hue.
-BG = "#121212"          # $background-color: content surface
-SIDE = "#0d0d0d"        # $dark-background-color: sidebar, title bar, bars
-CARD = "#171717"        # group container
-TILE = "#1c1c1c"        # thumbnail well, inputs, neutral buttons
-BORDER = "#272727"      # $border-color rgba(255,255,255,.08) over the background
-BORDER_HI = "#3f3f3f"   # hover, outlined buttons
+# ------------------------------------------------------------------ цвета (как в globals.scss у Hydra)
+# Всё чёрно-белое: важные кнопки залиты белым, а состояние плитки видно по рамке и яркости
+# (белая рамка — оригинал, затемнённая картинка — пойдёт в дубли), без цветных акцентов.
+BG = "#121212"          # фон основной области
+SIDE = "#0d0d0d"        # левая панель, заголовок окна, полосы
+CARD = "#171717"        # карточка группы
+TILE = "#1c1c1c"        # подложка превью, поля ввода, обычные кнопки
+BORDER = "#272727"      # рамки: белый с прозрачностью 8% поверх фона
+BORDER_HI = "#3f3f3f"   # наведение и контурные кнопки
 HOVER = "#222222"
-BRIGHT = "#f0f1f7"      # $muted-color: headings, primary fills
-TEXT = "#d0d1d7"        # $body-color
-MUTED = "#8e919b"       # $subtle-color: captions, helper text (>= 4.5:1 on every surface)
+BRIGHT = "#f0f1f7"      # заголовки и белые кнопки
+TEXT = "#d0d1d7"        # обычный текст
+MUTED = "#8e919b"       # подписи и подсказки (контраст не ниже 4.5:1 на любом фоне)
 ACCENT, ACCENT_H, ON_ACCENT = BRIGHT, "#ffffff", "#121212"
-DIM = 0.32              # brightness of a thumbnail marked for removal
+DIM = 0.32              # яркость превью, отмеченного в дубли
 DISABLED_TX = "#55575e"
 BACKDROP = "#070707"
 
-# Two families, as in Hydra: Noto Sans for all text, Space Grotesk for numbers.
+# Два шрифта, как в Hydra: Noto Sans для текста, Space Grotesk для цифр.
 TEXT_FONT, NUM_FONT, FALLBACK_FONT = "Noto Sans", "Space Grotesk", "Segoe UI"
 FONT_FILES = ("NotoSans-400.ttf", "NotoSans-500.ttf", "NotoSans-700.ttf", "SpaceGrotesk-700.ttf")
 
-# type scale: same as Hydra's globals.scss
+# размеры как у Hydra
 T_BODY, T_HINT, T_SMALL = 14, 13, 12
 
 SIDEBAR_W = 360
@@ -48,12 +48,12 @@ TW, TH = 224, 160
 GROUPS_PER_PAGE = 20
 DEFAULT_THR = 0.85
 
-# Segoe Fluent Icons / MDL2 code points
+# коды значков из шрифта Segoe Fluent Icons / MDL2
 I_FOLDER, I_SEARCH, I_STOP, I_CLOSE = "\uE838", "\uE721", "\uE71A", "\uE711"
 I_PREV, I_NEXT, I_TRASH, I_MOVE = "\uE76B", "\uE76C", "\uE74D", "\uE8DE"
 I_UNDO, I_PHOTO, I_CHECK, I_INFO = "\uE7A7", "\uE91B", "\uE73E", "\uE946"
 I_STAR, I_LANG, I_EDIT, I_PLAY, I_VIDEO = "\uE734", "\uE774", "\uE70F", "\uE768", "\uE714"
-I_DROP = "\uE896"  # download arrow: "drop here"
+I_DROP = "\uE896"  # стрелка вниз: «бросай сюда»
 
 _fonts_ok = False
 
@@ -71,7 +71,6 @@ def load_fonts():
 
 
 def F(size=T_BODY, weight="normal"):
-    """Text font. weight: normal | medium | bold."""
     if not _fonts_ok:
         return ctk.CTkFont(family=FALLBACK_FONT, size=size, weight="bold" if weight == "bold" else "normal")
     if weight == "medium":
@@ -80,12 +79,11 @@ def F(size=T_BODY, weight="normal"):
 
 
 def N(size=T_BODY):
-    """Number font."""
     return ctk.CTkFont(family=NUM_FONT if _fonts_ok else FALLBACK_FONT, size=size, weight="bold")
 
 
 def tkfont(size, weight="normal", num=False, s=1.0):
-    """Font tuple for plain tk widgets (CTk scales its own fonts; plain tk needs pixels)."""
+    # CTk сам масштабирует шрифты под DPI, а обычному tk нужен размер в пикселях
     if not _fonts_ok:
         fam = FALLBACK_FONT
     elif num:
@@ -98,7 +96,7 @@ def tkfont(size, weight="normal", num=False, s=1.0):
     return (fam, -round(size * s), weight)
 
 
-# ------------------------------------------------------------------ icons
+# ------------------------------------------------------------------ значки
 _icon_font_path = next((p for p in (r"C:\Windows\Fonts\SegoeIcons.ttf", r"C:\Windows\Fonts\segmdl2.ttf")
                         if os.path.exists(p)), None)
 ICON_FAMILY = "Segoe Fluent Icons" if _icon_font_path and "SegoeIcons" in _icon_font_path else "Segoe MDL2 Assets"
@@ -106,7 +104,7 @@ _icon_cache: dict = {}
 
 
 def icon(code: str, color: str = TEXT, size: int = 18):
-    """Icon from the Windows icon font as a CTkImage (None if the font is missing)."""
+    # Рисуем значок из системного шрифта Windows в картинку. Если шрифта нет — None.
     if not _icon_font_path:
         return None
     key = (code, color, size)
@@ -150,7 +148,7 @@ def set_enabled(b: ctk.CTkButton, on: bool):
     kw = {"state": "normal" if on else "disabled"}
     if ico:
         kw["image"] = icon(ico, fg if on else DISABLED_TX, sz)
-    if getattr(b, "_fg", None) not in (None, "transparent"):  # filled buttons go neutral when disabled
+    if getattr(b, "_fg", None) not in (None, "transparent"):  # белая кнопка в выключенном виде становится серой
         kw["fg_color"] = b._fg if on else TILE
     b.configure(**kw)
 
@@ -160,7 +158,7 @@ def label(parent, text="", size=T_BODY, color=TEXT, weight="normal", **kw):
 
 
 def link(parent, text, command, size=T_HINT):
-    """Text link: aligns flush with the text above it (a button would add inner padding)."""
+    # Ссылка текстом, а не кнопкой: у кнопки внутренние отступы, и она не встаёт ровно под текст
     w = ctk.CTkLabel(parent, text=text, font=ctk.CTkFont(family=F(size).cget("family"), size=size,
                                                           weight="bold", underline=True),
                      text_color=BRIGHT, cursor="hand2", anchor="w", height=24)
@@ -177,7 +175,7 @@ def checkbox(parent, text, var, size=20, fsize=T_BODY):
 
 
 def load_image(p: Path, max_side: int) -> Image.Image:
-    return core.open_picture(p, max_side)  # for a video: its middle frame
+    return core.open_picture(p, max_side)  # у видео — кадр из середины
 
 
 def open_external(p: Path):
@@ -203,7 +201,7 @@ def elide_left(text: str, n: int) -> str:
 
 
 def dark_title_bar(win, color=SIDE, text=BRIGHT):
-    """Paint the native Windows 11 title bar in the app's colors (no-op elsewhere)."""
+    # Красим системный заголовок окна в наши цвета. Работает только на Windows 11.
     try:
         hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
 
@@ -212,16 +210,16 @@ def dark_title_bar(win, color=SIDE, text=BRIGHT):
             return ctypes.c_int(int(c[4:6], 16) << 16 | int(c[2:4], 16) << 8 | int(c[0:2], 16))
 
         dwm = ctypes.windll.dwmapi.DwmSetWindowAttribute
-        # DWMWA_CAPTION_COLOR=35, DWMWA_TEXT_COLOR=36, DWMWA_BORDER_COLOR=34 (Windows 11 only)
+        # 35 — фон заголовка, 36 — текст, 34 — рамка (DWMWA_* из dwmapi)
         for attr, val in ((35, rgb(color)), (36, rgb(text)), (34, rgb(color))):
             dwm(hwnd, attr, ctypes.byref(val), ctypes.sizeof(val))
     except Exception:
         pass
 
 
-# ------------------------------------------------------------------ overlays
+# ------------------------------------------------------------------ всплывающие окна
 class Modal(ctk.CTkFrame):
-    """Full-window overlay; Esc closes it. blur=True shows the window behind, blurred and dimmed."""
+    # Слой поверх всего окна, закрывается по Esc. blur=True — сзади размытый снимок окна.
 
     def __init__(self, app: "App", blur: bool = False):
         super().__init__(app, fg_color=BACKDROP, corner_radius=0)
@@ -287,7 +285,6 @@ class Dialog(Modal):
 
 
 class Toast(ctk.CTkFrame):
-    """Short non-blocking confirmation above the action bar."""
 
     def __init__(self, app, text, ico=I_CHECK):
         super().__init__(app, fg_color=CARD, border_color=BORDER_HI, border_width=1, corner_radius=10)
@@ -403,10 +400,10 @@ class Preview(Modal):
         s = self.view._get_widget_scaling()
         bw, bh = self.view.winfo_width() / s, self.view.winfo_height() / s
         iw, ih = self._pil.size
-        r = min(bw / iw, bh / ih, 2.0 / s)  # small images: at most 2x
+        r = min(bw / iw, bh / ih, 2.0 / s)  # маленькие картинки растягиваем не больше чем вдвое
         img = ctk.CTkImage(light_image=self._pil, dark_image=self._pil,
                            size=(max(1, int(iw * r)), max(1, int(ih * r))))
-        self._keep.append(img)  # Tk must not lose an image a label still points to
+        self._keep.append(img)  # держим ссылку, иначе сборщик мусора удалит картинку и Tk покажет пустоту
         del self._keep[:-4]
         self.view.configure(image=img, text="")
 
@@ -437,7 +434,7 @@ class Preview(Modal):
         self.app.refresh_marks()
 
 
-# ------------------------------------------------------------------ main window
+# ------------------------------------------------------------------ главное окно
 SELECT_MODES = ("dupes", "older", "newer", "lowres", "hires", "clear")
 
 
@@ -473,7 +470,7 @@ class App(ctk.CTk):
         self.groups: list[list[int]] = []
         self.checks: dict[int, ctk.BooleanVar] = {}
         self.orig_set: set[int] = set()
-        self._stat: dict[int, tuple[int, float]] = {}
+        self._bulk = False
         self.sel_mode = "dupes"
         self._note_mode = None
         self.page = 0
@@ -503,7 +500,7 @@ class App(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._poll)
 
-    # ---------------------------------------------------------- settings / language
+    # ---------------------------------------------------------- настройки и язык
     def _save(self):
         save_settings({"lang": self.lang, "folder": self.folder.get(), "recursive": self.recursive.get(),
                        "gpu": self.use_gpu.get(), "threshold": round(self.threshold.get(), 2)})
@@ -536,9 +533,8 @@ class App(ctk.CTk):
         if self._busy() and self._last_progress:
             self._progress(*self._last_progress)
 
-    # ---------------------------------------------------------- status bar
+    # ---------------------------------------------------------- строка состояния
     def _build_status(self):
-        """Thin line across the bottom: current state on the left, version on the right (as in Hydra)."""
         st = self.status = ctk.CTkFrame(self, fg_color=SIDE, corner_radius=0, height=30)
         st.grid(row=1, column=0, columnspan=2, sticky="ew")
         st.pack_propagate(False)
@@ -547,12 +543,11 @@ class App(ctk.CTk):
         self.lbl_summary.pack(side="left", padx=18)
         label(st, f"Photo Dupes · v{__version__}", T_SMALL, MUTED, height=26).pack(side="right", padx=18)
 
-    # ---------------------------------------------------------- sidebar
+    # ---------------------------------------------------------- левая панель
     def _section(self, parent, text, top=20):
         label(parent, text, 16, BRIGHT, "bold", anchor="w").pack(fill="x", padx=28, pady=(top, 10))
 
     def _divider(self, parent):
-        """Hairline between sidebar sections, like the separator in Hydra's settings menu."""
         tk.Frame(parent, bg=BORDER, height=1).pack(fill="x", padx=28, pady=(22, 0))
 
     def _build_sidebar(self):
@@ -564,7 +559,7 @@ class App(ctk.CTk):
         tk.Frame(sb, bg=BORDER, width=1).place(relx=1.0, rely=0, relheight=1, anchor="ne")
         pad = dict(padx=28, fill="x")
 
-        # 1. folder: one big clickable card
+        # 1. папка — одна большая карточка, по ней можно кликнуть
         self._section(sb, t("folder"), top=24)
         card = self.folder_card = ctk.CTkFrame(sb, fg_color=TILE, corner_radius=10, border_width=1,
                                                border_color=BORDER, height=68, cursor="hand2")
@@ -589,7 +584,7 @@ class App(ctk.CTk):
             w.bind("<Enter>", lambda _e: card.configure(border_color=BORDER_HI, fg_color=HOVER))
             w.bind("<Leave>", lambda _e: card.configure(border_color=BORDER, fg_color=TILE))
 
-        # 2. strictness
+        # 2. строгость
         self._divider(sb)
         thr = ctk.CTkFrame(sb, fg_color="transparent")
         thr.pack(pady=(20, 6), **pad)
@@ -611,7 +606,7 @@ class App(ctk.CTk):
         label(rrow, t("recommend"), T_HINT, TEXT, anchor="w", justify="left", wraplength=250).pack(
             side="left", padx=(10, 0), fill="x")
 
-        # 3. options
+        # 3. настройки
         self._divider(sb)
         self._section(sb, t("options"))
         checkbox(sb, t("recursive"), self.recursive).pack(pady=(0, 12), **pad)
@@ -625,7 +620,7 @@ class App(ctk.CTk):
         label(hint, t("gpu_hint"), T_SMALL, MUTED, anchor="w", justify="left", wraplength=260).pack(fill="x")
         link(hint, t("gpu_more"), self._gpu_info, T_SMALL).pack(anchor="w", pady=(2, 0))
 
-        # 4. go
+        # 4. запуск
         self._divider(sb)
         self.btn_scan = button(sb, t("find"), self._scan, "accent", ico=I_SEARCH, height=44)
         self.btn_scan.pack(pady=(22, 0), **pad)
@@ -655,7 +650,7 @@ class App(ctk.CTk):
             self.folder_name.configure(text=self.t("folder_none"))
             self.folder_path.configure(text=self.t("folder_click"))
 
-    # ---------------------------------------------------------- main area
+    # ---------------------------------------------------------- правая часть
     def _build_main(self):
         t = self.t
         main = self.main = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
@@ -683,7 +678,7 @@ class App(ctk.CTk):
         self.btn_next = button(nav, "", lambda: self._go(1), ico=I_NEXT, width=42)
         self.btn_next.pack(side="left")
 
-        # selection rules: keep one file per group by a criterion, mark the rest
+        # быстрый выбор: в каждой группе оставляем один файл по правилу, остальные отмечаем
         self.selbar = ctk.CTkFrame(main, fg_color="transparent")
         chips = ctk.CTkFrame(self.selbar, fg_color="transparent")
         chips.pack(fill="x")
@@ -714,7 +709,7 @@ class App(ctk.CTk):
         self.btn_move = button(bar, t("move"), lambda: self._apply("move"), "accent", ico=I_MOVE)
         self.btn_move.pack(side="right")
 
-    # ---------------------------------------------------------- helpers
+    # ---------------------------------------------------------- мелочи
     def _on_key(self, e):
         if self.modals:
             self.modals[-1].on_key(e.keysym)
@@ -736,32 +731,31 @@ class App(ctk.CTk):
         d = filedialog.askdirectory(title=self.t("pick_title"), initialdir=self.folder.get() or None)
         if d:
             self.folder.set(os.path.normpath(d))
-            if not self._busy():  # new folder: old results don't apply, show "folder selected"
+            if not self._busy():  # новая папка: старые результаты не подходят, показываем «Папка выбрана»
                 self.res, self.groups, self.checks = None, [], {}
                 self._render()
             return True
         return False
 
     def _enable_drop(self):
-        """Accept a folder dragged from Explorer anywhere onto the window (Windows WM_DROPFILES)."""
         try:
             import windnd
 
-            # The callback runs inside the window procedure, where touching Tk (even after()) crashes
-            # Python. So it only drops the paths into the queue that _poll() already reads.
+            # Этот обработчик вызывается изнутри оконной процедуры Windows. Если тут тронуть Tk
+            # (даже after()), Python падает. Поэтому просто кладём пути в очередь, её читает _poll().
             windnd.hook_dropfiles(self, func=lambda paths: self.q.put(("drop", list(paths))), force_unicode=True)
         except Exception:
-            pass  # no windnd / not Windows: the "Choose folder" button still works
+            pass  # нет windnd или не Windows — остаётся кнопка «Выбрать папку»
 
     def _on_drop(self, paths):
         if not paths or self._busy():
             return
         p = Path(paths[0] if isinstance(paths[0], str) else paths[0].decode("utf-8", "replace"))
-        folder = p if p.is_dir() else p.parent  # dropped a photo -> use its folder
+        folder = p if p.is_dir() else p.parent  # бросили файл, а не папку — берём папку, где он лежит
         for m in list(self.modals):
             m.close()
-        # only choose the folder, don't start right away: the user may still want to change
-        # strictness or options. Old results belong to the old folder, so drop them.
+        # Только выбираем папку, поиск не запускаем: вдруг человек хочет сначала поменять строгость.
+        # Старые результаты относятся к прошлой папке — выкидываем.
         self.folder.set(os.path.normpath(str(folder)))
         self.res, self.groups, self.checks = None, [], {}
         self._render()
@@ -778,20 +772,11 @@ class App(ctk.CTk):
     def _busy(self):
         return self._worker is not None and self._worker.is_alive()
 
-    def _st(self, k):
-        if k not in self._stat:
-            try:
-                s = self.res.files[k].stat()
-                self._stat[k] = (s.st_size, s.st_mtime)
-            except OSError:
-                self._stat[k] = (0, 0.0)
-        return self._stat[k]
-
     def size_of(self, k: int) -> int:
-        return self._st(k)[0]
+        return int(self.res.size[k])  # размер и дата уже есть после поиска, диск не трогаем
 
     def date_of(self, k: int) -> str:
-        return time.strftime("%d.%m.%Y %H:%M", time.localtime(self._st(k)[1]))
+        return time.strftime("%d.%m.%Y %H:%M", time.localtime(float(self.res.mtime[k])))
 
     def _update_controls(self):
         t = self.t
@@ -848,7 +833,7 @@ class App(ctk.CTk):
         err = "  ·  " + t("unread", n=len(r.errors)) if r.errors else ""
         self.lbl_summary.configure(text=t("done_in", s=f"{r.seconds:.1f}", dev=dev) + err)
 
-    # ---------------------------------------------------------- scan
+    # ---------------------------------------------------------- поиск
     def _scan(self):
         t = self.t
         if self._busy():
@@ -866,7 +851,7 @@ class App(ctk.CTk):
         self._save()
         self._cancel = False
         self.scan_folder = folder
-        self.groups, self.res, self.checks, self._stat = [], None, {}, {}
+        self.groups, self.res, self.checks = [], None, {}
         self._last_progress = None
         self.lbl_summary.configure(text="")
         rec, gpu = self.recursive.get(), self.use_gpu.get()
@@ -956,32 +941,38 @@ class App(ctk.CTk):
         self._render()
         self.lbl_note.configure(text="")
 
-    # ---------------------------------------------------------- selection
+    # ---------------------------------------------------------- выбор файлов
     def _select(self, mode: str):
         self.sel_mode = mode
+        mt = self.res.mtime
+        # Без этого флага каждая из тысяч галочек пересчитывала бы статистику целиком.
+        # Пока он стоит, _on_check только перекрашивает плитку, а итоги считаем один раз в конце.
+        self._bulk = True
         for g in self.groups:
             if mode == "clear":
                 keep = None
             elif mode == "dupes":
                 keep = g[0]
-            elif mode == "older":    # keep the newest
-                keep = max(g, key=lambda k: (self._st(k)[1], k == g[0]))
-            elif mode == "newer":    # keep the oldest
-                keep = min(g, key=lambda k: (self._st(k)[1], k != g[0]))
-            elif mode == "lowres":   # keep the biggest resolution
+            elif mode == "older":    # оставляем самый новый
+                keep = max(g, key=lambda k: (mt[k], k == g[0]))
+            elif mode == "newer":    # оставляем самый старый
+                keep = min(g, key=lambda k: (mt[k], k != g[0]))
+            elif mode == "lowres":   # оставляем самое большое разрешение
                 keep = max(g, key=lambda k: (int(self.res.wh[k][0]) * int(self.res.wh[k][1]), k == g[0]))
-            else:                    # hires: keep the smallest resolution
+            else:                    # hires: оставляем самое маленькое
                 keep = min(g, key=lambda k: (int(self.res.wh[k][0]) * int(self.res.wh[k][1]), k != g[0]))
             for k in g:
                 v = self.checks[k]
                 want = keep is not None and k != keep
                 if v.get() != want:
                     v.set(want)
+        self._bulk = False
+        self._update_stats()
         self._note_mode = mode
         self.lbl_note.configure(text=self.t(f"note_{mode}"))
         self._update_controls()
 
-    # ---------------------------------------------------------- results
+    # ---------------------------------------------------------- результаты
     def _go(self, d):
         self.page += d
         self._render()
@@ -991,7 +982,7 @@ class App(ctk.CTk):
         return v is not None and v.get()
 
     def _paint_tile(self, k):
-        """White frame = original, dimmed picture + bin chip = marked for removal."""
+        # белая рамка — оригинал; затемнение и значок корзины — файл пойдёт в дубли
         tl = self._tiles.get(k)
         if tl is None or not tl.winfo_exists():
             return
@@ -1008,6 +999,8 @@ class App(ctk.CTk):
 
     def _on_check(self, k):
         self._paint_tile(k)
+        if self._bulk:
+            return
         self._update_stats()
         self._update_controls()
 
@@ -1062,7 +1055,7 @@ class App(ctk.CTk):
             return
         folder = self.folder.get().strip().strip('"')
         if not self.res and folder and Path(folder).is_dir():
-            # a folder is chosen (picked, dropped or remembered) but not searched yet
+            # папка уже выбрана (кликом, перетаскиванием или с прошлого раза), но поиска ещё не было
             self._empty_state(t("ready_title"), t("ready_text", name=Path(folder).name or folder),
                               lambda p: button(p, t("find"), self._scan, "accent", ico=I_SEARCH,
                                                height=44, width=220))
@@ -1077,7 +1070,7 @@ class App(ctk.CTk):
             self._empty_state(t("nodup_title"), t("nodup_text"))
             return
         s = self.results._get_widget_scaling()
-        # right after a rebuild the frame is not laid out yet: fall back to window width minus sidebar
+        # сразу после перестройки фрейм ещё не размечен и его ширина 0 — берём ширину окна минус панель
         avail = max(self.results.winfo_width() / s, self.winfo_width() / s - SIDEBAR_W - 40, 400)
         cols = max(1, int((avail - 60) // (TW + 16)))
         start = self.page * GROUPS_PER_PAGE
@@ -1085,12 +1078,10 @@ class App(ctk.CTk):
         self._render_chunk(self._render_id, todo, cols, s)
 
     def _render_chunk(self, rid, todo, cols, s):
-        """Groups are added 3 at a time via after(), so the window never freezes while a page fills in.
-
-        Every CTk widget is a small canvas and is slow to create (a page of 20 groups took ~3.7 s),
-        so text inside tiles uses plain tk.Label - about 2x faster. rid drops stale chunks
-        when the user switches page / threshold before the previous render finished.
-        """
+        # Группы добавляются по 3 штуки через after(), чтобы окно не зависало, пока страница заполняется.
+        # Каждый виджет CTk — это отдельный canvas, создаётся медленно (страница из 20 групп рисовалась
+        # ~3,7 с), поэтому подписи на плитках — обычные tk.Label, так раза в два быстрее.
+        # rid нужен, чтобы выкинуть недорисованные куски, если пользователь уже переключил страницу.
         if rid != self._render_id or not todo:
             return
         t = self.t
@@ -1120,7 +1111,7 @@ class App(ctk.CTk):
         img.bind("<Enter>", lambda _e: img.configure(border_color=self._tile_color(k, hover=True)))
         img.bind("<Leave>", lambda _e: img.configure(border_color=self._tile_color(k)))
 
-        # chips over the picture, like the badges on Hydra's library covers
+        # плашки поверх картинки, как значки на обложках в библиотеке Hydra
         if pos == 0:
             c = tk.Label(img, text=t("original"), font=tkfont(T_SMALL, "bold", s=s), fg=ON_ACCENT, bg=ACCENT,
                          padx=round(7 * s), pady=round(1 * s))
@@ -1128,7 +1119,7 @@ class App(ctk.CTk):
             c = tk.Label(img, text=pct(res.sim(g[0], k)), font=tkfont(T_SMALL, num=True, s=s), fg=BRIGHT,
                          bg="#0b0b0b", padx=round(7 * s), pady=round(1 * s))
         c.place(x=round(10 * s), y=round(10 * s))
-        if core.is_video(p):  # bottom-left "video" chip so videos stand out among photos
+        if core.is_video(p):  # плашка «видео» в левом нижнем углу, чтобы видео не терялись среди фото
             v = tk.Label(img, text=I_VIDEO, font=(ICON_FAMILY, -round(13 * s)), fg=BRIGHT, bg="#0b0b0b",
                          padx=round(6 * s), pady=round(4 * s))
             v.place(x=round(10 * s), rely=1.0, y=-round(10 * s), anchor="sw")
@@ -1181,7 +1172,7 @@ class App(ctk.CTk):
         self._tile_imgs[k] = pair
         self._paint_tile(k)
 
-    # ---------------------------------------------------------- actions
+    # ---------------------------------------------------------- перенос и удаление
     def _apply(self, mode: str):
         t = self.t
         sel = {k for k, v in self.checks.items() if v.get()}
