@@ -71,16 +71,28 @@ def load_fonts():
     _fonts_ok = ok
 
 
+# Шрифты кэшируем: раньше каждый виджет получал свой CTkFont, брошенные шрифты собирал сборщик
+# мусора — иногда в фоновом потоке, а удалять объекты Tk можно только из главного.
+_font_cache: dict = {}
+
+
+def _font(family, size, weight):
+    key = (family, size, weight)
+    if key not in _font_cache:
+        _font_cache[key] = ctk.CTkFont(family=family, size=size, weight=weight)
+    return _font_cache[key]
+
+
 def F(size=T_BODY, weight="normal"):
     if not _fonts_ok:
-        return ctk.CTkFont(family=FALLBACK_FONT, size=size, weight="bold" if weight == "bold" else "normal")
+        return _font(FALLBACK_FONT, size, "bold" if weight == "bold" else "normal")
     if weight == "medium":
-        return ctk.CTkFont(family=f"{TEXT_FONT} Medium", size=size)
-    return ctk.CTkFont(family=TEXT_FONT, size=size, weight=weight)
+        return _font(f"{TEXT_FONT} Medium", size, "normal")
+    return _font(TEXT_FONT, size, weight)
 
 
 def N(size=T_BODY):
-    return ctk.CTkFont(family=NUM_FONT if _fonts_ok else FALLBACK_FONT, size=size, weight="bold")
+    return _font(NUM_FONT if _fonts_ok else FALLBACK_FONT, size, "bold")
 
 
 def tkfont(size, weight="normal", num=False, s=1.0):
@@ -167,6 +179,9 @@ def restyle(b, **kw):
 
 
 def set_enabled(b: ctk.CTkButton, on: bool):
+    if getattr(b, "_on", None) == on:  # ничего не поменялось — не дёргаем перерисовку кнопки
+        return
+    b._on = on
     ico, fg, sz = getattr(b, "_ico", (None, None, 18))
     kw = {"state": "normal" if on else "disabled"}
     if ico:
@@ -186,6 +201,15 @@ def checkbox(parent, text, var, size=20, fsize=T_BODY):
     return ctk.CTkCheckBox(parent, text=text, variable=var, font=F(fsize), text_color=TEXT,
                            border_color=BORDER_HI, corner_radius=5, checkbox_width=size, checkbox_height=size,
                            fg_color=ACCENT, hover_color=ACCENT_H, checkmark_color=ON_ACCENT, border_width=2)
+
+
+def _thumb_pair(im: Image.Image):
+    """Картинка для плитки, её затемнённая серая копия (для «пойдёт в дубли») и размер.
+    Считается в фоновом потоке: на главном это заметно тормозило, когда превью приходили пачкой."""
+    r = min((TW - 8) / im.width, (TH - 8) / im.height)
+    size = (max(1, int(im.width * r)), max(1, int(im.height * r)))
+    dim = ImageEnhance.Brightness(ImageOps.grayscale(im).convert("RGB")).enhance(DIM)
+    return im, dim, size
 
 
 def load_image(p: Path, max_side: int) -> Image.Image:
@@ -918,8 +942,11 @@ class App(ctk.CTk):
             self._progress_lbl.configure(text=name + "…")
 
     def _poll(self):
+        # не дольше 40 мс за раз: если разом пришла сотня превью, окно всё равно успевает
+        # перерисоваться и не получает от Windows метку «Не отвечает»
+        deadline = time.perf_counter() + 0.04
         try:
-            for _ in range(200):
+            while time.perf_counter() < deadline:
                 msg = self.q.get_nowait()
                 kind = msg[0]
                 if kind == "progress":
@@ -1066,6 +1093,7 @@ class App(ctk.CTk):
         self._clear()
         self._update_controls()
         self._update_stats()
+        self.update_idletasks()  # дорисовать кнопки внизу до того, как начнём строить тяжёлую страницу
         if self._busy():
             box = self._empty_state(t("scan_title"), t("scan_text"))
             self._pbar = ctk.CTkProgressBar(box, width=460, height=8, corner_radius=4, fg_color=BORDER_HI,
@@ -1101,7 +1129,7 @@ class App(ctk.CTk):
         cols = max(1, int((avail - 60) // (TW + 16)))
         start = self.page * GROUPS_PER_PAGE
         todo = list(enumerate(self.groups[start:start + GROUPS_PER_PAGE], start + 1))
-        self._render_chunk(self._render_id, todo, cols, s)
+        self.after(30, self._render_chunk, self._render_id, todo, cols, s)  # сначала даём окну дорисовать кнопки
 
     def _render_chunk(self, rid, todo, cols, s):
         # Группы добавляются по 3 штуки через after(), чтобы окно не зависало, пока страница заполняется.
@@ -1123,7 +1151,10 @@ class App(ctk.CTk):
             grid.pack(fill="x", padx=16, pady=(12, 16))
             for pos, k in enumerate(g):
                 self._tile(grid, g, pos, k, s).grid(row=pos // cols, column=pos % cols, padx=6, pady=4, sticky="n")
-        self.after(1, self._render_chunk, rid, todo[3:], cols, s)
+        # Tk перерисовывает окно только в «свободное время», а цепочка after(1) его не оставляет:
+        # кнопки внизу, перенастроенные в начале, висели недорисованными, пока не догрузится вся страница.
+        self.update_idletasks()
+        self.after(5, self._render_chunk, rid, todo[3:], cols, s)
 
     def _tile(self, parent, g, pos, k, s):
         t, res = self.t, self.res
@@ -1174,7 +1205,7 @@ class App(ctk.CTk):
 
         def job():
             try:
-                im = load_image(p, TW * 2)
+                im = _thumb_pair(load_image(p, TW * 2))
             except Exception:
                 im = None
             if im is not None:
@@ -1189,9 +1220,7 @@ class App(ctk.CTk):
         if im is None:
             lbl.configure(text=self.t("no_preview"), text_color=MUTED, font=F(T_SMALL))
             return
-        r = min((TW - 8) / im.width, (TH - 8) / im.height)
-        size = (max(1, int(im.width * r)), max(1, int(im.height * r)))
-        dim = ImageEnhance.Brightness(ImageOps.grayscale(im).convert("RGB")).enhance(DIM)
+        im, dim, size = im
         pair = (ctk.CTkImage(light_image=im, dark_image=im, size=size),
                 ctk.CTkImage(light_image=dim, dark_image=dim, size=size))
         self._thumb_imgs.extend(pair)
