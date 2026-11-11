@@ -159,17 +159,48 @@ def button(parent, text, command, kind="normal", ico=None, size=T_BODY, height=4
     return b
 
 
+def animate(widget, ms: int, step, done=None):
+    """Зовёт step(t) с t от 0 до 1 в течение ms миллисекунд (с замедлением к концу), потом done()."""
+    t0 = time.perf_counter()
+
+    def tick():
+        if not widget.winfo_exists():
+            return
+        x = min(1.0, (time.perf_counter() - t0) * 1000 / ms)
+        step(1 - (1 - x) ** 3)
+        if x < 1:
+            widget.after(15, tick)
+        elif done:
+            done()
+
+    tick()
+
+
+def mix(a: str, b: str, k: float) -> str:
+    """Цвет между a и b (оба вида #rrggbb): k=0 — это a, k=1 — это b."""
+    ca, cb = (int(a[i:i + 2], 16) for i in (1, 3, 5)), (int(b[i:i + 2], 16) for i in (1, 3, 5))
+    return "#" + "".join(f"{round(x + (y - x) * k):02x}" for x, y in zip(ca, cb))
+
+
 def _hover(b, on: bool):
     # CTk при наведении меняет только заливку, и на тёмном фоне это почти не видно.
     # Как в Hydra, под курсором ещё светлеют рамка и текст — сразу понятно, что это кнопка.
     # Белые кнопки не трогаем: у них и так заметный hover_color.
     if b.cget("state") == "disabled" or b._rest["fg_color"] == ACCENT:
         return
-    color = BRIGHT if on else b._rest["text_color"]
-    kw = dict(text_color=color, border_color=HOVER_BORDER if on else b._rest["border_color"])
+    b._hov = on
     if b._ico[0]:
-        kw["image"] = icon(b._ico[0], color, b._ico[2])
-    b.configure(**kw)
+        b.configure(image=icon(b._ico[0], BRIGHT if on else b._rest["text_color"], b._ico[2]))
+
+    def step(t):
+        # пока шла анимация, кнопку могли выключить, выбрать или курсор уже ушёл — тогда не мешаем
+        if b._hov != on or b.cget("state") == "disabled" or b._rest["fg_color"] == ACCENT:
+            return
+        k = t if on else 1 - t
+        b.configure(text_color=mix(b._rest["text_color"], BRIGHT, k),
+                    border_color=mix(b._rest["border_color"], HOVER_BORDER, k))
+
+    animate(b, 110, step)
 
 
 def restyle(b, **kw):
@@ -255,6 +286,90 @@ def dark_title_bar(win, color=SIDE, text=BRIGHT):
         pass
 
 
+# ------------------------------------------------------------------ плавная прокрутка
+WHEEL_PX = 130  # на сколько пикселей прокручивает один щелчок колеса
+
+
+class SmoothScroll(ctk.CTkScrollableFrame):
+    """Список с плавной прокруткой.
+
+    Обычный CTkScrollableFrame двигает содержимое рывком на каждое событие колеса и не ждёт,
+    пока сотни вложенных виджетов перерисуются, — при быстрой прокрутке картинка рвалась на полосы.
+    Здесь колесо и ползунок только задают, куда надо доехать, а едем мы сами: не чаще раза
+    в ~12 мс и каждый раз даём окну дорисоваться.
+    """
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._to = None      # куда едем, доля от 0 до 1
+        self._jump = False   # ползунок тянут мышью: без разгона, сразу в точку
+        self._job = None
+        self._moving = False  # идёт шаг прокрутки (см. _tick)
+        self._scrollbar.configure(command=self._from_bar)
+
+    def reset(self):
+        self._to = None
+        self._parent_canvas.yview_moveto(0)
+
+    def _height(self) -> int:
+        box = self._parent_canvas.bbox("all")
+        return max(1, box[3] - box[1]) if box else 1
+
+    def _from_bar(self, *args):
+        if args and args[0] == "moveto":
+            self._to, self._jump = float(args[1]), True
+            self._kick()
+        else:
+            self._parent_canvas.yview(*args)
+
+    def _mouse_wheel_all(self, event):
+        if getattr(self.winfo_toplevel(), "modals", None):  # открыт просмотр или диалог — список под ним не трогаем
+            return
+        if not self._check_if_valid_scroll(event.widget):
+            return
+        top, bottom = self._parent_canvas.yview()
+        if bottom - top >= 1:
+            return
+        step = -event.delta / 120 * WHEEL_PX * self._get_widget_scaling() / self._height()
+        start = top if self._to is None else self._to
+        self._to, self._jump = min(max(start + step, 0.0), 1.0 - (bottom - top)), False
+        self._kick()
+
+    def _kick(self):
+        if self._job is None and not self._moving:
+            self._job = self.after(8, self._tick)
+
+    def _tick(self):
+        self._job = None
+        if self._to is None or not self.winfo_exists():
+            return
+        cv = self._parent_canvas
+        top, bottom = cv.yview()
+        target = min(max(self._to, 0.0), max(0.0, 1.0 - (bottom - top)))
+        left = target - top
+        if self._jump or abs(left) * self._height() < 1.5:
+            new, self._to = target, None
+        else:
+            new = top + left * 0.3
+        cv.yview_moveto(new)
+        # Плитки — это отдельные окна Windows: сдвигаются они сразу, а дорисовываются по сообщению,
+        # которое ждёт в очереди. update() обрабатывает очередь прямо сейчас, поэтому каждый кадр целый.
+        # Он же может принять новый щелчок колеса или клик — на это время ставим флаг, чтобы шаг
+        # не запустился внутри самого себя.
+        self._moving = True
+        try:
+            self.update()
+        finally:
+            self._moving = False
+        if not self.winfo_exists():
+            return
+        if self._to is not None:
+            if abs(cv.yview()[0] - top) < 1e-9 and not self._jump:  # упёрлись в край, дальше ехать некуда
+                self._to = None
+            else:
+                self._job = self.after(8, self._tick)
+
+
 # ------------------------------------------------------------------ всплывающие окна
 class Modal(ctk.CTkFrame):
     # Слой поверх всего окна, закрывается по Esc. blur=True — сзади размытый снимок окна.
@@ -297,7 +412,8 @@ class Dialog(Modal):
         super().__init__(app, blur=not app.modals)
         self._on_ok = on_ok
         panel = ctk.CTkFrame(self, fg_color=CARD, border_color=BORDER, border_width=1, corner_radius=12)
-        panel.place(relx=0.5, rely=0.5, anchor="center")
+        panel.place(relx=0.5, rely=0.5, anchor="center", y=18)
+        animate(panel, 160, lambda t: panel.place_configure(y=round(18 * (1 - t))))
         head = ctk.CTkFrame(panel, fg_color="transparent")
         head.pack(fill="x", padx=(28, 14), pady=(18, 0))
         label(head, title, 16, BRIGHT, "bold").pack(side="left")
@@ -330,9 +446,11 @@ class Toast(ctk.CTkFrame):
         row.pack(padx=18, pady=14)
         ctk.CTkLabel(row, text="", image=icon(ico, BRIGHT, 20)).pack(side="left", padx=(0, 12))
         label(row, text, T_BODY, BRIGHT, justify="left").pack(side="left")
-        self.place(relx=1.0, rely=1.0, x=-32, y=-120, anchor="se")
+        self.place(relx=1.0, rely=1.0, x=-32, y=80, anchor="se")
         self.lift()
-        self.after(4000, self.destroy)
+        animate(self, 220, lambda t: self.place_configure(y=round(80 - 200 * t)))
+        self.after(4000, lambda: animate(self, 180, lambda t: self.place_configure(y=round(-120 + 220 * t ** 2)),
+                                         self.destroy))
 
 
 class Preview(Modal):
@@ -415,7 +533,12 @@ class Preview(Modal):
                 im = e
             app.q.put(("preview", self, token, im))
 
-        threading.Thread(target=work, daemon=True).start()
+        def start():
+            if token == self._token:
+                threading.Thread(target=work, daemon=True).start()
+
+        # небольшая пауза: если стрелку держат зажатой, промежуточные картинки не грузим вовсе
+        self.after(70, start)
 
     def set_image(self, token, im):
         if token != self._token or not self.winfo_exists():
@@ -516,6 +639,9 @@ class App(ctk.CTk):
         self._cancel = False
         self._worker: threading.Thread | None = None
         self._regroup_job = None
+        self._resize_job = None
+        self._cols = 0
+        self._pbar_to = 0.0
         self._render_id = 0
         self._tiles: dict[int, ctk.CTkLabel] = {}
         self._tile_imgs: dict[int, tuple] = {}
@@ -534,6 +660,7 @@ class App(ctk.CTk):
         self.folder.trace_add("write", lambda *_a: self._paint_folder())
         self._build_ui()
         self.bind_all("<Key>", self._on_key)
+        self.bind("<Configure>", self._on_resize)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._poll)
 
@@ -721,9 +848,9 @@ class App(ctk.CTk):
             b.pack(side="left", padx=(0, 8))
             self.chips[m] = b
 
-        self.results = ctk.CTkScrollableFrame(main, fg_color=BG, corner_radius=0,
-                                              scrollbar_button_color=BORDER_HI,
-                                              scrollbar_button_hover_color="#5a5a5a")
+        self.results = SmoothScroll(main, fg_color=BG, corner_radius=0,
+                                    scrollbar_button_color=BORDER_HI,
+                                    scrollbar_button_hover_color="#5a5a5a")
         self.results.grid(row=2, column=0, sticky="nsew", padx=(28, 8), pady=(14, 0))
 
         bar = ctk.CTkFrame(main, fg_color=SIDE, corner_radius=0, height=68)
@@ -830,12 +957,16 @@ class App(ctk.CTk):
     def _update_controls(self):
         t = self.t
         busy = self._busy()
-        if busy:
-            self.btn_scan.configure(text=t("stop"), fg_color=TILE, hover_color=HOVER, text_color=BRIGHT,
-                                    border_width=1, border_color=BORDER_HI, image=icon(I_STOP, BRIGHT, 16))
-        else:
-            self.btn_scan.configure(text=t("find"), fg_color=ACCENT, hover_color=ACCENT_H, text_color=ON_ACCENT,
-                                    border_width=0, image=icon(I_SEARCH, ON_ACCENT, 16))
+        # Эта функция зовётся на каждый клик по галочке. Раньше она каждый раз перенастраивала кнопку
+        # поиска и все кнопки выбора (у CTk это полная перерисовка) — теперь только если что-то поменялось.
+        if getattr(self.btn_scan, "_shown", None) != busy:
+            self.btn_scan._shown = busy
+            if busy:
+                self.btn_scan.configure(text=t("stop"), fg_color=TILE, hover_color=HOVER, text_color=BRIGHT,
+                                        border_width=1, border_color=BORDER_HI, image=icon(I_STOP, BRIGHT, 16))
+            else:
+                self.btn_scan.configure(text=t("find"), fg_color=ACCENT, hover_color=ACCENT_H,
+                                        text_color=ON_ACCENT, border_width=0, image=icon(I_SEARCH, ON_ACCENT, 16))
         has = bool(self.groups) and not busy
         if has:
             self.selbar.grid(row=1, column=0, sticky="ew", padx=36, pady=(18, 0))
@@ -843,8 +974,10 @@ class App(ctk.CTk):
             self.selbar.grid_forget()
         for m, b in self.chips.items():
             on = m == self.sel_mode
-            restyle(b, fg_color=ACCENT if on else TILE, hover_color=ACCENT_H if on else HOVER,
-                    text_color=ON_ACCENT if on else TEXT, border_color=ACCENT if on else BORDER)
+            if getattr(b, "_shown", None) != on:
+                b._shown = on
+                restyle(b, fg_color=ACCENT if on else TILE, hover_color=ACCENT_H if on else HOVER,
+                        text_color=ON_ACCENT if on else TEXT, border_color=ACCENT if on else BORDER)
         marked = has and any(v.get() for v in self.checks.values())
         for b in (self.btn_trash, self.btn_move):
             set_enabled(b, marked)
@@ -928,7 +1061,9 @@ class App(ctk.CTk):
             self._stage_t0 = (stage, time.time())
         name = t(f"st_{stage}")
         if total:
-            self._pbar.set(done / total)
+            self._pbar_to = done / total
+            if self._pbar_to < self._pbar.get():  # начался новый этап — полоса сразу в начало
+                self._pbar.set(self._pbar_to)
             eta = ""
             el = time.time() - self._stage_t0[1]
             if done > 20 and el > 2:
@@ -938,8 +1073,18 @@ class App(ctk.CTk):
             self._progress_lbl.configure(text=f"{name}: {t('of', d=done, t=total)}{eta}")
             self.lbl_summary.configure(text=f"{name}: {t('of', d=done, t=total)}")
         else:
+            self._pbar_to = 0
             self._pbar.set(0)
             self._progress_lbl.configure(text=name + "…")
+
+    def _pbar_tick(self, pbar):
+        # полоса догоняет настоящий прогресс понемногу, а не прыгает пачками по 64 файла
+        if not pbar.winfo_exists():
+            return
+        cur = pbar.get()
+        if abs(self._pbar_to - cur) > 0.001:
+            pbar.set(cur + (self._pbar_to - cur) * 0.2)
+        pbar.after(33, self._pbar_tick, pbar)
 
     def _poll(self):
         # не дольше 40 мс за раз: если разом пришла сотня превью, окно всё равно успевает
@@ -1074,10 +1219,7 @@ class App(ctk.CTk):
         self._tile_rm.clear()
         self._thumb_imgs.clear()
         self._progress_lbl = None
-        try:
-            self.results._parent_canvas.yview_moveto(0)
-        except Exception:
-            pass
+        self.results.reset()
 
     def _empty_state(self, title, text, action=None):
         box = ctk.CTkFrame(self.results, fg_color="transparent")
@@ -1100,6 +1242,8 @@ class App(ctk.CTk):
                                             progress_color=BRIGHT)
             self._pbar.set(0)
             self._pbar.pack()
+            self._pbar_to = 0
+            self._pbar_tick(self._pbar)
             self._progress_lbl = label(box, t("prep"), T_HINT, MUTED)
             self._progress_lbl.pack(pady=(12, 0))
             self._stage_t0 = (None, 0.0)
@@ -1124,12 +1268,30 @@ class App(ctk.CTk):
             self._empty_state(t("nodup_title"), t("nodup_text"))
             return
         s = self.results._get_widget_scaling()
-        # сразу после перестройки фрейм ещё не размечен и его ширина 0 — берём ширину окна минус панель
-        avail = max(self.results.winfo_width() / s, self.winfo_width() / s - SIDEBAR_W - 40, 400)
-        cols = max(1, int((avail - 60) // (TW + 16)))
+        cols = self._cols = self._cols_now()
         start = self.page * GROUPS_PER_PAGE
         todo = list(enumerate(self.groups[start:start + GROUPS_PER_PAGE], start + 1))
         self.after(30, self._render_chunk, self._render_id, todo, cols, s)  # сначала даём окну дорисовать кнопки
+
+    def _cols_now(self) -> int:
+        s = self.results._get_widget_scaling()
+        # сразу после перестройки фрейм ещё не размечен и его ширина 0 — берём ширину окна минус панель
+        avail = max(self.results.winfo_width() / s, self.winfo_width() / s - SIDEBAR_W - 40, 400)
+        return max(1, int((avail - 60) // (TW + 16)))
+
+    def _on_resize(self, e):
+        # <Configure> прилетает и от всех вложенных виджетов, нам нужно только само окно
+        if e.widget is not self:
+            return
+        if self._resize_job:
+            self.after_cancel(self._resize_job)
+        self._resize_job = self.after(250, self._reflow)
+
+    def _reflow(self):
+        # окно растянули или сжали — если теперь влезает другое число плиток в ряд, перестраиваем страницу
+        self._resize_job = None
+        if self.groups and not self._busy() and not self.modals and self._cols_now() != self._cols:
+            self._render()
 
     def _render_chunk(self, rid, todo, cols, s):
         # Группы добавляются по 3 штуки через after(), чтобы окно не зависало, пока страница заполняется.
