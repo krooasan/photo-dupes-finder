@@ -9,19 +9,26 @@ env/
 # PyInstaller
 build/
 dist/
+dist_tmp/
 *.spec
 build.log
 
-# model is too big for git, get it with tools/export_onnx.py
+# модель слишком большая для git, её делает tools/export_onnx.py
 models/*.onnx
 models/*.pt
 
-# files the app writes next to your photos
+# то, что программа пишет рядом с фото
 .photo_dupes_cache.npz
 *.tmp.npz
 dupes_report_*.csv
+Дубли/
 
-# IDE / OS
+# свои фото для проверки, в репозиторий не нужны
+test_photos/
+samples/
+demo/
+
+# IDE и система
 .idea/
 .vscode/
 *.swp
