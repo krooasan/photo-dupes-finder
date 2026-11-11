@@ -199,8 +199,8 @@ def preprocess(p: Path):
             frames, w, h = video_frames(p)
         return np.stack([_to_input(f) for f in frames]), w, h, content_ratio(frames[len(frames) // 2])
     with Image.open(p) as im:
-        w, h = im.size
         rgb = ImageOps.exif_transpose(im).convert("RGB")
+    w, h = rgb.size  # после поворота по EXIF: у фото с телефона «лёжа» записаны только пиксели
     return _to_input(rgb), w, h, content_ratio(rgb)
 
 
