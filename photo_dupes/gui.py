@@ -27,7 +27,8 @@ CARD = "#171717"        # карточка группы
 TILE = "#1c1c1c"        # подложка превью, поля ввода, обычные кнопки
 BORDER = "#272727"      # рамки: белый с прозрачностью 8% поверх фона
 BORDER_HI = "#3f3f3f"   # наведение и контурные кнопки
-HOVER = "#222222"
+HOVER = "#2a2a2a"
+HOVER_BORDER = "#626262"  # рамка кнопки под курсором
 BRIGHT = "#f0f1f7"      # заголовки и белые кнопки
 TEXT = "#d0d1d7"        # обычный текст
 MUTED = "#8e919b"       # подписи и подсказки (контраст не ниже 4.5:1 на любом фоне)
@@ -53,7 +54,6 @@ I_FOLDER, I_SEARCH, I_STOP, I_CLOSE = "\uE838", "\uE721", "\uE71A", "\uE711"
 I_PREV, I_NEXT, I_TRASH, I_MOVE = "\uE76B", "\uE76C", "\uE74D", "\uE8DE"
 I_UNDO, I_PHOTO, I_CHECK, I_INFO = "\uE7A7", "\uE91B", "\uE73E", "\uE946"
 I_STAR, I_LANG, I_EDIT, I_PLAY, I_VIDEO = "\uE734", "\uE774", "\uE70F", "\uE768", "\uE714"
-I_DROP = "\uE896"  # стрелка вниз: «бросай сюда»
 
 _fonts_ok = False
 
@@ -140,7 +140,29 @@ def button(parent, text, command, kind="normal", ico=None, size=T_BODY, height=4
     b = ctk.CTkButton(parent, text=text, command=command, **opts)
     b._ico = (ico, fg, ico_size)
     b._fg = opts["fg_color"]
+    b._rest = dict(fg_color=opts["fg_color"], text_color=fg, border_color=opts.get("border_color", BORDER))
+    b.bind("<Enter>", lambda _e: _hover(b, True), add="+")
+    b.bind("<Leave>", lambda _e: _hover(b, False), add="+")
     return b
+
+
+def _hover(b, on: bool):
+    # CTk при наведении меняет только заливку, и на тёмном фоне это почти не видно.
+    # Как в Hydra, под курсором ещё светлеют рамка и текст — сразу понятно, что это кнопка.
+    # Белые кнопки не трогаем: у них и так заметный hover_color.
+    if b.cget("state") == "disabled" or b._rest["fg_color"] == ACCENT:
+        return
+    color = BRIGHT if on else b._rest["text_color"]
+    kw = dict(text_color=color, border_color=HOVER_BORDER if on else b._rest["border_color"])
+    if b._ico[0]:
+        kw["image"] = icon(b._ico[0], color, b._ico[2])
+    b.configure(**kw)
+
+
+def restyle(b, **kw):
+    """Поменять «спокойный» вид кнопки так, чтобы уход курсора его не сбрасывал."""
+    b._rest.update({k: v for k, v in kw.items() if k in b._rest})
+    b.configure(**kw)
 
 
 def set_enabled(b: ctk.CTkButton, on: bool):
@@ -150,22 +172,13 @@ def set_enabled(b: ctk.CTkButton, on: bool):
         kw["image"] = icon(ico, fg if on else DISABLED_TX, sz)
     if getattr(b, "_fg", None) not in (None, "transparent"):  # белая кнопка в выключенном виде становится серой
         kw["fg_color"] = b._fg if on else TILE
+    if hasattr(b, "_rest"):  # кнопку могли выключить прямо под курсором — сбрасываем подсветку
+        kw.update(text_color=b._rest["text_color"], border_color=b._rest["border_color"])
     b.configure(**kw)
 
 
 def label(parent, text="", size=T_BODY, color=TEXT, weight="normal", **kw):
     return ctk.CTkLabel(parent, text=text, font=F(size, weight), text_color=color, **kw)
-
-
-def link(parent, text, command, size=T_HINT):
-    # Ссылка текстом, а не кнопкой: у кнопки внутренние отступы, и она не встаёт ровно под текст
-    w = ctk.CTkLabel(parent, text=text, font=ctk.CTkFont(family=F(size).cget("family"), size=size,
-                                                          weight="bold", underline=True),
-                     text_color=BRIGHT, cursor="hand2", anchor="w", height=24)
-    w.bind("<Button-1>", lambda _e: command())
-    w.bind("<Enter>", lambda _e: w.configure(text_color="#ffffff"))
-    w.bind("<Leave>", lambda _e: w.configure(text_color=BRIGHT))
-    return w
 
 
 def checkbox(parent, text, var, size=20, fsize=T_BODY):
@@ -471,7 +484,6 @@ class App(ctk.CTk):
         self.checks: dict[int, ctk.BooleanVar] = {}
         self._bulk = False
         self.sel_mode = "dupes"
-        self._note_mode = None
         self.page = 0
         self.modals: list[Modal] = []
         self.q: queue.Queue = queue.Queue()
@@ -527,8 +539,6 @@ class App(ctk.CTk):
         self._on_threshold(regroup=False)
         self._paint_folder()
         self._render()
-        if self._note_mode and self.groups:
-            self.lbl_note.configure(text=self.t(f"note_{self._note_mode}"))
         if self._busy() and self._last_progress:
             self._progress(*self._last_progress)
 
@@ -550,7 +560,7 @@ class App(ctk.CTk):
         tk.Frame(parent, bg=BORDER, height=1).pack(fill="x", padx=28, pady=(22, 0))
 
     def _build_sidebar(self):
-        """Left column reads top to bottom as the workflow: folder → strictness → options → search."""
+        # левая панель читается сверху вниз как порядок действий: папка → строгость → настройки → поиск
         t = self.t
         sb = self.sidebar = ctk.CTkFrame(self, fg_color=SIDE, corner_radius=0, width=SIDEBAR_W)
         sb.grid(row=0, column=0, sticky="nsw")
@@ -563,10 +573,6 @@ class App(ctk.CTk):
         card = self.folder_card = ctk.CTkFrame(sb, fg_color=TILE, corner_radius=10, border_width=1,
                                                border_color=BORDER, height=68, cursor="hand2")
         card.pack(**pad)
-        drop = ctk.CTkFrame(sb, fg_color="transparent")
-        drop.pack(pady=(8, 0), **pad)
-        ctk.CTkLabel(drop, text="", image=icon(I_DROP, MUTED, 14)).pack(side="left")
-        label(drop, t("drop_short"), T_SMALL, MUTED, anchor="w").pack(side="left", padx=(8, 0))
         card.pack_propagate(False)
         self.folder_icon = ctk.CTkLabel(card, text="", image=icon(I_FOLDER, BRIGHT, 22), width=34)
         self.folder_icon.pack(side="left", padx=(18, 10))
@@ -580,7 +586,7 @@ class App(ctk.CTk):
         self.folder_edit.pack(side="right", padx=(0, 16))
         for w in (card, self.folder_icon, txt, self.folder_name, self.folder_path, self.folder_edit):
             w.bind("<Button-1>", lambda _e: self._pick())
-            w.bind("<Enter>", lambda _e: card.configure(border_color=BORDER_HI, fg_color=HOVER))
+            w.bind("<Enter>", lambda _e: card.configure(border_color=HOVER_BORDER, fg_color=HOVER))
             w.bind("<Leave>", lambda _e: card.configure(border_color=BORDER, fg_color=TILE))
 
         # 2. строгость
@@ -597,13 +603,8 @@ class App(ctk.CTk):
         ends.pack(**pad)
         label(ends, t("more_found"), T_SMALL, MUTED).pack(side="left")
         label(ends, t("less_err"), T_SMALL, MUTED).pack(side="right")
-        rec = ctk.CTkFrame(sb, fg_color=TILE, corner_radius=10)
-        rec.pack(pady=(12, 0), **pad)
-        rrow = ctk.CTkFrame(rec, fg_color="transparent")
-        rrow.pack(fill="x", padx=14, pady=12)
-        ctk.CTkLabel(rrow, text="", image=icon(I_STAR, BRIGHT, 16)).pack(side="left", anchor="n", pady=3)
-        label(rrow, t("recommend"), T_HINT, TEXT, anchor="w", justify="left", wraplength=250).pack(
-            side="left", padx=(10, 0), fill="x")
+        button(sb, t("recommend"), lambda: self.threshold.set(0.85), "normal", ico=I_STAR, size=T_HINT,
+               height=34, anchor="w").pack(pady=(14, 0), **pad)
 
         # 3. настройки
         self._divider(sb)
@@ -612,12 +613,8 @@ class App(ctk.CTk):
         gpu_row = ctk.CTkFrame(sb, fg_color="transparent")
         gpu_row.pack(**pad)
         checkbox(gpu_row, t("gpu"), self.use_gpu).pack(side="left")
-        button(gpu_row, "", self._gpu_info, "ghost", ico=I_INFO, width=32, height=32,
-               text_color=MUTED).pack(side="right")
-        hint = ctk.CTkFrame(sb, fg_color="transparent")
-        hint.pack(padx=(58, 28), fill="x")
-        label(hint, t("gpu_hint"), T_SMALL, MUTED, anchor="w", justify="left", wraplength=260).pack(fill="x")
-        link(hint, t("gpu_more"), self._gpu_info, T_SMALL).pack(anchor="w", pady=(2, 0))
+        button(gpu_row, "", self._gpu_info, "ghost", ico=I_INFO, width=32, height=32, ico_size=18,
+               text_color=TEXT).pack(side="right")
 
         # 4. запуск
         self._divider(sb)
@@ -670,11 +667,12 @@ class App(ctk.CTk):
         self.lbl_sub = label(titles, "", T_BODY, MUTED, anchor="w")
         self.lbl_sub.pack(anchor="w", pady=(2, 0))
         self.nav = nav = ctk.CTkFrame(head, fg_color="transparent")
-        self.btn_prev = button(nav, "", lambda: self._go(-1), ico=I_PREV, width=42)
+        arrow = dict(width=44, height=40, ico_size=18, text_color=BRIGHT, border_color=BORDER_HI)
+        self.btn_prev = button(nav, "", lambda: self._go(-1), ico=I_PREV, **arrow)
         self.btn_prev.pack(side="left")
-        self.lbl_page = label(nav, "", T_HINT, MUTED, width=100)
+        self.lbl_page = ctk.CTkLabel(nav, text="", font=N(T_BODY), text_color=TEXT, width=76)
         self.lbl_page.pack(side="left")
-        self.btn_next = button(nav, "", lambda: self._go(1), ico=I_NEXT, width=42)
+        self.btn_next = button(nav, "", lambda: self._go(1), ico=I_NEXT, **arrow)
         self.btn_next.pack(side="left")
 
         # быстрый выбор: в каждой группе оставляем один файл по правилу, остальные отмечаем
@@ -684,13 +682,9 @@ class App(ctk.CTk):
         label(chips, t("select"), T_BODY, MUTED).pack(side="left", padx=(0, 12))
         self.chips = {}
         for m in SELECT_MODES:
-            b = ctk.CTkButton(chips, text=t(f"sel_{m}"), command=lambda m=m: self._select(m), height=36,
-                              width=0, corner_radius=8, font=F(T_BODY, "medium"), fg_color=TILE, hover_color=HOVER,
-                              border_width=1, border_color=BORDER, text_color=TEXT)
+            b = button(chips, t(f"sel_{m}"), lambda m=m: self._select(m), height=36, width=0)
             b.pack(side="left", padx=(0, 8))
             self.chips[m] = b
-        self.lbl_note = label(self.selbar, "", T_HINT, MUTED, anchor="w")
-        self.lbl_note.pack(fill="x", pady=(8, 0))
 
         self.results = ctk.CTkScrollableFrame(main, fg_color=BG, corner_radius=0,
                                               scrollbar_button_color=BORDER_HI,
@@ -793,8 +787,8 @@ class App(ctk.CTk):
             self.selbar.grid_forget()
         for m, b in self.chips.items():
             on = m == self.sel_mode
-            b.configure(fg_color=ACCENT if on else TILE, hover_color=ACCENT_H if on else HOVER,
-                        text_color=ON_ACCENT if on else TEXT, border_color=ACCENT if on else BORDER)
+            restyle(b, fg_color=ACCENT if on else TILE, hover_color=ACCENT_H if on else HOVER,
+                    text_color=ON_ACCENT if on else TEXT, border_color=ACCENT if on else BORDER)
         marked = has and any(v.get() for v in self.checks.values())
         for b in (self.btn_trash, self.btn_move):
             set_enabled(b, marked)
@@ -812,7 +806,7 @@ class App(ctk.CTk):
         if not r:
             self.lbl_head.configure(text=t("title_empty"))
             self.pill.pack_forget()
-            self.lbl_sub.configure(text=t("title_sub"))
+            self.lbl_sub.configure(text="")
             self.lbl_sel.configure(text="")
             return
         n_dup = sum(len(g) - 1 for g in self.groups)
@@ -934,10 +928,9 @@ class App(ctk.CTk):
                 v = ctk.BooleanVar(value=k != g[0])
                 v.trace_add("write", lambda *_a, k=k: self._on_check(k))
                 self.checks[k] = v
-        self.sel_mode, self._note_mode = "dupes", None
+        self.sel_mode = "dupes"
         self.page = 0
         self._render()
-        self.lbl_note.configure(text="")
 
     # ---------------------------------------------------------- выбор файлов
     def _select(self, mode: str):
@@ -966,8 +959,6 @@ class App(ctk.CTk):
                     v.set(want)
         self._bulk = False
         self._update_stats()
-        self._note_mode = mode
-        self.lbl_note.configure(text=self.t(f"note_{mode}"))
         self._update_controls()
 
     # ---------------------------------------------------------- результаты
@@ -1013,7 +1004,7 @@ class App(ctk.CTk):
         # после «Старые»/«Новые» сразу видно, что именно останется в папке
         if not self._marked(k):
             return ACCENT
-        return BORDER_HI if hover else TILE
+        return HOVER_BORDER if hover else TILE
 
     def _clear(self):
         self._render_id += 1
