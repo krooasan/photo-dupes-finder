@@ -1,8 +1,8 @@
 """Строки интерфейса (ru / en) и настройки пользователя."""
 from __future__ import annotations
 
+import ctypes
 import json
-import locale
 import os
 from pathlib import Path
 
@@ -10,11 +10,9 @@ LANGS = ("ru", "en")
 
 S = {
     "ru": {
-        "app_sub": "поиск дублей фото",
         "folder": "Папка",
         "kind_photo": "Фото",
         "kind_video": "Видео",
-        "pick": "Выбрать папку",
         "recursive": "Искать в подпапках",
         "gpu": "Считать на видеокарте",
         "gpu_title": "Что значит «считать на видеокарте»",
@@ -35,7 +33,6 @@ S = {
         "more_found": "больше находок",
         "less_err": "меньше ошибок",
         "recommend": "Рекомендуем 0.85",
-        "reset": "Вернуть 0.85",
         "find": "Найти дубли",
         "stop": "Остановить",
         "undo_prev": "Откатить прошлый перенос…",
@@ -43,7 +40,6 @@ S = {
         "title_photo": "Дубли фото",
         "title_video": "Дубли видео",
         "groups_head": "Группы дублей",
-        "groups_title": ("{n} группа дублей", "{n} группы дублей", "{n} групп дублей"),
         "sub": ("{n} лишняя копия", "{n} лишние копии", "{n} лишних копий"),
         "sub_of": "среди {m} файлов",
         "no_dupes_title": "Дублей нет",
@@ -128,11 +124,9 @@ S = {
         "units": ("Б", "КБ", "МБ", "ГБ"),
     },
     "en": {
-        "app_sub": "duplicate photo finder",
         "folder": "Folder",
         "kind_photo": "Photos",
         "kind_video": "Videos",
-        "pick": "Choose folder",
         "recursive": "Include subfolders",
         "gpu": "Use graphics card",
         "gpu_title": "What “use graphics card” means",
@@ -153,7 +147,6 @@ S = {
         "more_found": "finds more",
         "less_err": "fewer mistakes",
         "recommend": "Recommended: 0.85",
-        "reset": "Back to 0.85",
         "find": "Find duplicates",
         "stop": "Stop",
         "undo_prev": "Undo last move…",
@@ -161,7 +154,6 @@ S = {
         "title_photo": "Duplicate photos",
         "title_video": "Duplicate videos",
         "groups_head": "Duplicate groups",
-        "groups_title": ("{n} duplicate group", "{n} duplicate groups"),
         "sub": ("{n} extra copy", "{n} extra copies"),
         "sub_of": "among {m} files",
         "no_dupes_title": "No duplicates",
@@ -282,11 +274,11 @@ def _settings_path() -> Path:
 
 
 def default_lang() -> str:
+    # язык интерфейса Windows; 0x19 — русский
     try:
-        loc = (locale.getlocale()[0] or "") + (locale.getdefaultlocale()[0] or "")
+        return "ru" if ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3FF == 0x19 else "en"
     except Exception:
-        loc = ""
-    return "ru" if "ru" in loc.lower() or "russian" in loc.lower() else "en"
+        return "en"
 
 
 def load_settings() -> dict:

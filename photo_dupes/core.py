@@ -28,9 +28,8 @@ except ImportError:
     pass
 
 Image.MAX_IMAGE_PIXELS = None  # огромные панорамы и длинные скриншоты тоже открываем
-# Pillow подгружает плагины форматов (PNG, JPEG…) лениво, при первом open(). Если это происходит
-# в фоновом потоке, а сборщик мусора в этот момент удаляет объект Tk, окно намертво зависает
-# (поток ждёт главный, главный ждёт блокировку импорта). Поэтому грузим всё сразу, при импорте.
+# Плагины форматов грузим сразу. Иначе Pillow импортирует их при первом open() в фоновом потоке,
+# и если в этот момент сборщик мусора трогает объект Tk — окно виснет насмерть.
 Image.init()
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif"}
@@ -48,8 +47,7 @@ TOP_K = 64         # сколько самых похожих соседей п�
 BARS_RATIO = 0.9   # если реальная картинка занимает меньше 90% кадра — значит, есть рамки/полосы
 MAX_SIDE = 1728    # длинная сторона входа в модель; иначе скриншот 1080×30000 не влезет в видеопамять
 CHUNK = 64         # сколько файлов декодируем за раз (иначе готовые картинки копятся в памяти)
-# Декодер видео (особенно 4K) сам держит сотни мегабайт буферов. 8 таких одновременно — это 3,5 ГБ,
-# поэтому видео читаем не больше чем по два за раз; фото по-прежнему идут во все потоки.
+# Декодер 4K-видео сам по себе держит сотни мегабайт, поэтому видео читаем максимум по два за раз
 _video_slots = threading.Semaphore(2)
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
 STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
@@ -142,8 +140,7 @@ def video_frames(p: Path, n: int | None = None) -> tuple[list[Image.Image], int,
                 cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
             ok, f = cap.read()
             if ok:
-                # Сразу уменьшаем: 32 кадра 4K — это ~800 МБ, а таких видео декодируется 8 одновременно
-                # (так однажды улетело 6 ГБ памяти). Модели всё равно нужно только 288 px.
+                # сразу уменьшаем: 32 кадра 4K — это ~800 МБ, а модели всё равно нужно 288 px
                 short = min(f.shape[:2])
                 if short > 576:
                     k = 576 / short
@@ -172,12 +169,8 @@ def open_picture(p: Path, max_side: int | None = None) -> Image.Image:
 
 
 def _to_input(im: Image.Image) -> np.ndarray:
-    """Картинка -> вход модели.
-
-    Должно в точности совпадать с тем, на чём учили SSCD (torchvision Resize(288) + Normalize),
-    иначе отпечатки «поплывут». Проверял против torchvision — массивы совпадают байт в байт.
-    Короткая сторона становится 288, поэтому у картинок с разными пропорциями разный размер.
-    """
+    """Картинка -> вход модели. Повторяет torchvision Resize(288) + Normalize, как при обучении SSCD,
+    иначе отпечатки поплывут. Короткая сторона 288, длинная — по пропорциям."""
     iw, ih = im.size
     s = 288
     if iw <= ih:
@@ -280,8 +273,7 @@ class ScanResult:
     ratio: np.ndarray    # (n,) доля кадра без рамок и полос
     size: np.ndarray     # (n,) размер файла в байтах
     mtime: np.ndarray    # (n,) время изменения, секунды
-    # похожие пары тремя массивами: i < j и их сходство. Массивы, а не словарь {(i, j): s} —
-    # словарь Python на сотнях тысяч пар весит в десятки раз больше.
+    # похожие пары (i < j) и их сходство; массивы, а не dict — на сотнях тысяч пар это в разы меньше памяти
     pair_i: np.ndarray
     pair_j: np.ndarray
     pair_s: np.ndarray
@@ -312,10 +304,8 @@ def scan(folder: Path, recursive: bool, progress: Progress, cancel: Callable[[],
         emb = Embedder(use_gpu)
         device = emb.device
         progress("analyze", 0, len(todo))
-        # В одну пачку для модели можно сложить только картинки одного размера, а после
-        # preprocess у них разные пропорции. Поэтому раскладываем по «корзинам» по размеру
-        # и запускаем корзину, когда в ней набралось 16 штук (скриншоты с одного монитора
-        # все одного размера, так что пачки почти всегда полные).
+        # В одну пачку можно сложить только картинки одного размера, поэтому раскладываем их
+        # по корзинам и запускаем корзину, когда наберётся batch_size штук.
         buckets: dict[tuple, list] = {}
         done = 0
         last_save = time.time()
@@ -346,9 +336,8 @@ def scan(folder: Path, recursive: bool, progress: Progress, cancel: Callable[[],
             except Exception as e:  # битый файл, обрезанная загрузка и т.п. — пропускаем, не падаем
                 return p, None, 0, 0, 1.0, f"{type(e).__name__}: {e}"
 
-        # Декодирование PNG/JPEG — самое медленное, поэтому идёт в потоках, пока видеокарта считает.
-        # Файлы отдаём порциями по CHUNK: если отдать все сразу, потоки декодируют быстрее,
-        # чем считает модель, и готовые картинки (~1,7 МБ каждая) копятся в памяти гигабайтами.
+        # Декодирование — самое медленное, оно идёт в потоках, пока считает модель. Порциями по CHUNK,
+        # иначе потоки обгоняют модель и готовые картинки копятся в памяти гигабайтами.
         with ThreadPoolExecutor(max_workers=max(2, min(8, (os.cpu_count() or 4)))) as pool:
             for c0 in range(0, len(todo), CHUNK):
                 if cancel():
@@ -358,8 +347,7 @@ def scan(folder: Path, recursive: bool, progress: Progress, cancel: Callable[[],
                         errors.append((p, err))
                         done += 1
                     elif arr.ndim == 4:
-                        # видео: все кадры — одна пачка, отпечаток видео — их среднее.
-                        # Так пересжатая или обрезанная по времени копия всё равно оказывается рядом.
+                        # видео: отпечаток — среднее по кадрам, так обрезанная копия всё равно рядом
                         try:
                             e = emb(arr).mean(axis=0)
                             put(p, w, h, ratio, e / max(np.linalg.norm(e), 1e-12))
@@ -374,8 +362,7 @@ def scan(folder: Path, recursive: bool, progress: Progress, cancel: Callable[[],
                         elif sum(len(v) for v in buckets.values()) > 4 * batch_size:
                             # много картинок разных размеров: не держим их все, запускаем самую полную корзину
                             flush(max(buckets, key=lambda k: len(buckets[k])))
-                    # счётчик двигаем после каждого файла: порция из 64 файлов с видео
-                    # может считаться 5-10 секунд, и без этого кажется, что всё зависло
+                    # двигаем счётчик на каждом файле, а не на порции: с видео порция идёт секунды
                     progress("analyze", done + sum(len(v) for v in buckets.values()), len(todo))
                 if time.time() - last_save > 30:  # чтобы «Стоп» или вылет не обнулили работу
                     save_cache(cache_path, cache)
@@ -421,12 +408,10 @@ def scan(folder: Path, recursive: bool, progress: Progress, cancel: Callable[[],
 
 
 def _similar_pairs(E: np.ndarray, progress: Progress):
-    """Похожие пары: для каждого файла — до TOP_K самых похожих соседей со сходством >= PAIR_FLOOR.
+    """Для каждого файла — до TOP_K ближайших соседей со сходством >= PAIR_FLOOR.
 
-    Полная матрица n×n на 50 000 фото — это 10 ГБ, поэтому считаем полосами строк и сразу
-    выкидываем лишнее. Хранить все пары выше порога нельзя: в папке из 10 000 однотипных
-    скриншотов их 50 миллионов (проверял — 2,2 ГБ памяти). Для групп хватает ближайших соседей:
-    копии одного снимка всегда друг у друга в топе.
+    Полная матрица n×n не влезет в память, поэтому считаем полосами. И все пары выше порога
+    не храним: в папке однотипных скриншотов их десятки миллионов, а для групп хватает соседей.
     """
     n = len(E)
     if n < 2:
@@ -499,11 +484,8 @@ def original_key(res: ScanResult, k: int):
 
 def _components(n: int, i: np.ndarray, j: np.ndarray) -> np.ndarray:
     """Номер компоненты связности для каждого файла (A~B и B~C -> одна компонента).
-
-    Обычный union-find в цикле Python на десятках миллионов пар идёт минутами, поэтому
-    делаем то же самое векторно: каждому узлу раз за разом присваиваем минимальную метку
-    среди соседей, пока метки не перестанут меняться.
-    """
+    Union-find в цикле на питоне тут слишком медленный, поэтому векторно: раз за разом
+    даём узлу минимальную метку среди соседей, пока метки не перестанут меняться."""
     labels = np.arange(n)
     if len(i) == 0:
         return labels
@@ -529,9 +511,8 @@ def group(res: ScanResult, threshold: float) -> list[list[int]]:
         if len(comp) < 2:
             continue
         rest = comp
-        # Компоненты бывают цепочками: A~B, B~C, но A и C — разные фото (кадры одной серии).
-        # Поэтому внутри компоненты оставляем только тех, кто похож на выбранный оригинал,
-        # а остальных так же перегруппировываем между собой.
+        # Компонента может быть цепочкой: A~B, B~C, но A и C — уже разные кадры серии.
+        # Поэтому в группу берём только похожих на оригинал, остальных группируем заново.
         while len(rest) > 1:
             orig = max(rest, key=lambda k: original_key(res, int(k)))
             sims = res.emb[rest] @ res.emb[orig]
@@ -559,8 +540,7 @@ def unique_dest(dest: Path) -> Path:
 def apply(folder: Path, res: ScanResult, groups: list[list[int]], selected: set[int],
           mode: str) -> tuple[int, Path | None]:
     """mode: 'move' -> <папка>/Дубли/group_NNNN/, 'trash' -> Корзина.
-    Для переноса пишет отчёт CSV в папку «Дубли» — по нему потом работает откат. Рядом с фото
-    ничего лишнего не остаётся. Для Корзины отчёт не нужен: вернуть файл можно из самой Корзины.
+    При переносе пишет в «Дубли» отчёт CSV, по нему работает откат. Для Корзины отчёт не нужен.
     Возвращает (сколько файлов обработано, путь к отчёту или None)."""
     stamp = time.strftime("%Y%m%d_%H%M%S")
     dup_root = folder / DUP_DIR_NAME
@@ -595,17 +575,15 @@ def apply(folder: Path, res: ScanResult, groups: list[list[int]], selected: set[
                     done_to = str(dest)
                 else:
                     send2trash(str(p))
-                    done_to = "Корзина"
                 count += 1
             rows.append({"group": gname, "role": "ORIGINAL" if k == orig else "DUPLICATE",
                          "file": str(p), "width": int(res.wh[k][0]), "height": int(res.wh[k][1]),
                          "sim_to_original": f"{res.sim(orig, k):.4f}",
-                         "moved_to": done_to if mode == "move" else "",
-                         "action": ("moved" if mode == "move" else "trash") if done_to else "kept"})
+                         "moved_to": done_to, "action": "moved" if done_to else "kept"})
         gnum += 1
     report = None
-    if rows and mode == "move" and count:
-        report = unique_dest(dup_root / f"dupes_report_{stamp}.csv")  # два переноса за одну секунду не затрут друг друга
+    if mode == "move" and count:
+        report = unique_dest(dup_root / f"dupes_report_{stamp}.csv")
         # utf-8-sig — чтобы Excel правильно открыл кириллицу
         with open(report, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.DictWriter(f, fieldnames=list(rows[0]), delimiter=";")
@@ -621,11 +599,9 @@ def _report_rows(report: Path) -> list[dict]:
 
 def last_report(folder: Path) -> tuple[Path, int] | None:
     """Самый свежий отчёт переноса, по которому ещё есть что возвращать, и сколько файлов вернётся.
-    Ищем в «Дубли», а также рядом с фото — там лежат отчёты старых версий."""
+    Смотрим в «Дубли» и рядом с фото — туда отчёт писала версия 1.0."""
     for rep in sorted([*(folder / DUP_DIR_NAME).glob("dupes_report_*.csv"), *folder.glob("dupes_report_*.csv")],
                       key=lambda p: p.name, reverse=True):
-        if rep.stem.endswith("_dry"):  # пробный прогон старого скрипта, ничего не переносил
-            continue
         try:
             n = sum(1 for r in _report_rows(rep) if r.get("moved_to") and Path(r["moved_to"]).exists())
         except (OSError, csv.Error, UnicodeDecodeError):

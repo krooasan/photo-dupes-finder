@@ -71,8 +71,8 @@ def load_fonts():
     _fonts_ok = ok
 
 
-# Шрифты кэшируем: раньше каждый виджет получал свой CTkFont, брошенные шрифты собирал сборщик
-# мусора — иногда в фоновом потоке, а удалять объекты Tk можно только из главного.
+# Один CTkFont на сочетание размер+начертание. Иначе брошенные шрифты собирает сборщик мусора,
+# иногда в фоновом потоке, а объекты Tk можно удалять только из главного.
 _font_cache: dict = {}
 
 
@@ -235,16 +235,11 @@ def checkbox(parent, text, var, size=20, fsize=T_BODY):
 
 
 def _thumb_pair(im: Image.Image, box: tuple[int, int]):
-    """Картинка для плитки (уже нужного размера) и её затемнённая серая копия для «пойдёт в дубли».
-    Считается в фоновом потоке: на главном это заметно тормозило, когда превью приходили пачкой."""
+    """Превью под размер плитки и его затемнённая серая копия (для «пойдёт в дубли»). Зовётся в фоне."""
     r = min(box[0] / im.width, box[1] / im.height)
     im = im.resize((max(1, int(im.width * r)), max(1, int(im.height * r))), Image.LANCZOS)
     dim = ImageEnhance.Brightness(ImageOps.grayscale(im).convert("RGB")).enhance(DIM)
     return im, dim
-
-
-def load_image(p: Path, max_side: int) -> Image.Image:
-    return core.open_picture(p, max_side)  # у видео — кадр из середины
 
 
 def open_external(p: Path):
@@ -293,10 +288,9 @@ WHEEL_PX = 130  # на сколько пикселей прокручивает 
 class Page(ctk.CTkFrame):
     """Область результатов: один холст с плавной прокруткой.
 
-    Раньше каждая плитка была набором отдельных виджетов (а в Windows каждый виджет — своё окошко),
-    и при быстрой прокрутке сотни окошек не успевали перерисоваться: картинка рвалась на полосы.
-    Теперь вся страница нарисована на одном холсте, он сдвигается и перерисовывается целиком.
-    Колесо и ползунок только задают, куда надо доехать, а едем мы сами, с замедлением к концу.
+    Плитки рисуются прямо на холсте, а не отдельными виджетами: в Windows каждый виджет — своё
+    окошко, и при быстрой прокрутке сотни окошек не успевают перерисоваться, картинка рвётся.
+    Колесо и ползунок только задают цель, а доезжаем до неё сами, с замедлением.
     """
 
     def __init__(self, master):
@@ -622,7 +616,7 @@ class Preview(Modal):
 
         def work():
             try:
-                im = load_image(p, 2560)
+                im = core.open_picture(p, 2560)
             except Exception as e:
                 im = e
             app.q.put(("preview", self, token, im))
@@ -779,8 +773,8 @@ class App(ctk.CTk):
     def _build_ui(self):
         cover = None
         if self._frames:
-            # Смена языка пересоздаёт весь интерфейс. Старые виджеты исчезают, а новые встают на места
-            # не одновременно — на секунду было видно кнопки не там. На это время закрываем окно ширмой.
+            # при смене языка интерфейс пересоздаётся, и пока новые виджеты встают на места,
+            # окно мелькает — закрываем его на это время ширмой
             cover = tk.Frame(self, bg=BG)
             cover.place(x=0, y=0, relwidth=1, relheight=1)
             cover.lift()
@@ -1071,8 +1065,8 @@ class App(ctk.CTk):
     def _update_controls(self):
         t = self.t
         busy = self._busy()
-        # Эта функция зовётся на каждый клик по галочке. Раньше она каждый раз перенастраивала кнопку
-        # поиска и все кнопки выбора (у CTk это полная перерисовка) — теперь только если что-то поменялось.
+        # зовётся на каждый клик по галочке, а configure() у CTk перерисовывает кнопку целиком —
+        # поэтому трогаем кнопки, только если их вид правда поменялся
         if getattr(self.btn_scan, "_shown", None) != busy:
             self.btn_scan._shown = busy
             if busy:
@@ -1254,8 +1248,7 @@ class App(ctk.CTk):
     def _select(self, mode: str):
         self.sel_mode = mode
         mt = self.res.mtime
-        # Без этого флага каждая из тысяч галочек пересчитывала бы статистику целиком.
-        # Пока он стоит, _on_check только перекрашивает плитку, а итоги считаем один раз в конце.
+        # пока стоит _bulk, _on_check только перекрашивает плитку, а итоги считаем один раз в конце
         self._bulk = True
         for g in self.groups:
             if mode == "clear":
@@ -1342,7 +1335,7 @@ class App(ctk.CTk):
         self._clear()
         self._update_controls()
         self._update_stats()
-        self.update_idletasks()  # дорисовать кнопки внизу до того, как начнём строить тяжёлую страницу
+        self.update_idletasks()  # сразу дорисовать кнопки внизу, пока не началась тяжёлая работа
         if self._busy():
             box = self._empty_state(t("scan_title"), t("scan_text"), busy=True)
             self._pbar = ctk.CTkProgressBar(box, width=460, height=8, corner_radius=4, fg_color=BORDER_HI,
@@ -1374,8 +1367,8 @@ class App(ctk.CTk):
         if not self.groups:
             self._empty_state(t("nodup_title"), t("nodup_text"))
             return
-        # Саму страницу рисуем чуть позже: кнопки внизу только что перенастроены, и окну нужно
-        # успеть их перерисовать. Иначе, пока строится страница, они висят недорисованными.
+        # страницу рисуем с небольшой задержкой, чтобы окно успело перерисовать кнопки внизу,
+        # иначе пока строится страница они висят недорисованными
         self.after(30, self._draw_later, self._render_id, scroll_to)
 
     def _draw_later(self, rid, scroll_to):
@@ -1409,8 +1402,7 @@ class App(ctk.CTk):
             self._render(scroll_to=self.results.canvas.yview()[0])
 
     def _draw_page(self, todo):
-        """Рисует группы страницы на холсте. Размеры ниже — в «логических» пикселях, P() переводит
-        их в настоящие с учётом масштаба Windows (125%, 150%…)."""
+        """Рисует группы страницы на холсте. Размеры — в логических пикселях, P() учитывает масштаб Windows."""
         cv, t = self.results.canvas, self.t
         s = self.results._get_widget_scaling()
 
@@ -1513,7 +1505,7 @@ class App(ctk.CTk):
 
         def job():
             try:
-                pair = _thumb_pair(load_image(p, max(TW * 2, box[0])), box)
+                pair = _thumb_pair(core.open_picture(p, max(TW * 2, box[0])), box)
             except Exception:
                 pair = None
             if pair is not None:
