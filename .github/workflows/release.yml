@@ -17,6 +17,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/sscd
+          key: sscd-9f26bd4c848c
       - name: Convert SSCD to ONNX
         run: |
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
