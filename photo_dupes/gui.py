@@ -1563,13 +1563,25 @@ class App(ctk.CTk):
 
     def _undo(self):
         t = self.t
-        folder = self.folder.get().strip().strip('"') or None
-        rep = filedialog.askopenfilename(title=t("undo_title"), initialdir=folder,
-                                         filetypes=[(t("report"), "dupes_report_*.csv")])
-        if not rep:
+        folder = self.folder.get().strip().strip('"')
+        found = core.last_report(Path(folder)) if folder and Path(folder).is_dir() else None
+        if found is None:
+            # в выбранной папке переносов нет — даём выбрать отчёт вручную (например, из другой папки)
+            rep = filedialog.askopenfilename(title=t("undo_title"), initialdir=folder or None,
+                                             filetypes=[(t("report"), "dupes_report_*.csv")])
+            if rep:
+                self._do_undo(Path(rep))
             return
+        rep, n = found
+        Dialog(self, t("undo_ask_title"), t("undo_ask_text", n=t.n("files", n)), t("undo_ok"), "accent",
+               on_ok=lambda: self._do_undo(rep), ok_icon=I_UNDO)
+
+    def _do_undo(self, rep: Path):
+        t = self.t
+        # отчёт лежит либо в «Дубли», либо (у старых версий) рядом с фото
+        folder = rep.parent.parent if rep.parent.name == core.DUP_DIR_NAME else rep.parent
         try:
-            back, skipped = core.undo(Path(rep).parent, Path(rep))
+            back, skipped = core.undo(folder, rep)
         except Exception as e:
             self.info(t("err_title"), f"{type(e).__name__}: {e}")
             return

@@ -559,7 +559,9 @@ def unique_dest(dest: Path) -> Path:
 def apply(folder: Path, res: ScanResult, groups: list[list[int]], selected: set[int],
           mode: str) -> tuple[int, Path | None]:
     """mode: 'move' -> <папка>/Дубли/group_NNNN/, 'trash' -> Корзина.
-    Пишет отчёт CSV. Возвращает (сколько файлов обработано, путь к отчёту)."""
+    Для переноса пишет отчёт CSV в папку «Дубли» — по нему потом работает откат. Рядом с фото
+    ничего лишнего не остаётся. Для Корзины отчёт не нужен: вернуть файл можно из самой Корзины.
+    Возвращает (сколько файлов обработано, путь к отчёту или None)."""
     stamp = time.strftime("%Y%m%d_%H%M%S")
     dup_root = folder / DUP_DIR_NAME
     rows, count = [], 0
@@ -602,8 +604,8 @@ def apply(folder: Path, res: ScanResult, groups: list[list[int]], selected: set[
                          "action": ("moved" if mode == "move" else "trash") if done_to else "kept"})
         gnum += 1
     report = None
-    if rows:
-        report = folder / f"dupes_report_{stamp}.csv"
+    if rows and mode == "move" and count:
+        report = unique_dest(dup_root / f"dupes_report_{stamp}.csv")  # два переноса за одну секунду не затрут друг друга
         # utf-8-sig — чтобы Excel правильно открыл кириллицу
         with open(report, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.DictWriter(f, fieldnames=list(rows[0]), delimiter=";")
@@ -612,10 +614,31 @@ def apply(folder: Path, res: ScanResult, groups: list[list[int]], selected: set[
     return count, report
 
 
-def undo(folder: Path, report: Path) -> tuple[int, int]:
-    """Возвращает файлы на место по отчёту переноса и убирает копии ORIGINAL_."""
+def _report_rows(report: Path) -> list[dict]:
     with open(report, encoding="utf-8-sig", newline="") as f:
-        rows = list(csv.DictReader(f, delimiter=";"))
+        return list(csv.DictReader(f, delimiter=";"))
+
+
+def last_report(folder: Path) -> tuple[Path, int] | None:
+    """Самый свежий отчёт переноса, по которому ещё есть что возвращать, и сколько файлов вернётся.
+    Ищем в «Дубли», а также рядом с фото — там лежат отчёты старых версий."""
+    for rep in sorted([*(folder / DUP_DIR_NAME).glob("dupes_report_*.csv"), *folder.glob("dupes_report_*.csv")],
+                      key=lambda p: p.name, reverse=True):
+        if rep.stem.endswith("_dry"):  # пробный прогон старого скрипта, ничего не переносил
+            continue
+        try:
+            n = sum(1 for r in _report_rows(rep) if r.get("moved_to") and Path(r["moved_to"]).exists())
+        except (OSError, csv.Error, UnicodeDecodeError):
+            continue
+        if n:
+            return rep, n
+    return None
+
+
+def undo(folder: Path, report: Path) -> tuple[int, int]:
+    """Возвращает файлы на место по отчёту переноса и убирает копии ORIGINAL_.
+    Если вернулось всё, удаляет и сам отчёт, а пустую папку «Дубли» — тоже."""
+    rows = _report_rows(report)
     back = skipped = 0
     for r in rows:
         if r.get("moved_to"):
@@ -637,6 +660,8 @@ def undo(folder: Path, report: Path) -> tuple[int, int]:
             c.unlink()
         if gdir.is_dir() and not any(gdir.iterdir()):
             gdir.rmdir()
+    if not skipped:  # всё вернули — отчёт больше не нужен
+        report.unlink(missing_ok=True)
     if dup_root.is_dir() and not any(dup_root.iterdir()):
         dup_root.rmdir()
     return back, skipped

@@ -238,12 +238,16 @@ def test_move_and_undo(tmp_path, quiet):
     assert {p.name for p in tmp_path.glob("*.jpg")} == {"keep.jpg"}
     gdir = tmp_path / core.DUP_DIR_NAME / "group_0001"
     assert {p.name for p in gdir.iterdir()} == {"copy1.jpg", "copy2.jpg", "ORIGINAL_keep.jpg"}
-    assert report.exists()
+    # отчёт лежит в «Дубли», рядом с фото ничего лишнего
+    assert report.parent == tmp_path / core.DUP_DIR_NAME
+    assert not list(tmp_path.glob("*.csv"))
+    assert core.last_report(tmp_path) == (report, 2)
 
     back, skipped = core.undo(tmp_path, report)
     assert (back, skipped) == (2, 0)
     assert {p.name: p.read_bytes() for p in tmp_path.glob("*.jpg")} == before
     assert not (tmp_path / core.DUP_DIR_NAME).exists()
+    assert core.last_report(tmp_path) is None
 
 
 @has_model
@@ -256,7 +260,9 @@ def test_second_move_continues_group_numbers(tmp_path, quiet):
     assert len(groups) == 2
     core.apply(tmp_path, res, groups[:1], set(groups[0][1:]), "move")
     core.apply(tmp_path, res, groups[1:], set(groups[1][1:]), "move")
-    assert sorted(p.name for p in (tmp_path / core.DUP_DIR_NAME).iterdir()) == ["group_0001", "group_0002"]
+    dup = tmp_path / core.DUP_DIR_NAME
+    assert sorted(p.name for p in dup.iterdir() if p.is_dir()) == ["group_0001", "group_0002"]
+    assert len(list(dup.glob("dupes_report_*.csv"))) == 2
 
 
 @has_model
@@ -269,8 +275,9 @@ def test_trash_uses_recycle_bin(tmp_path, quiet, monkeypatch):
     scene(3).save(tmp_path / "b.jpg", quality=50)
     res = core.scan(tmp_path, False, *quiet)
     groups = core.group(res, THR)
-    count, _ = core.apply(tmp_path, res, groups, set(groups[0][1:]), "trash")
+    count, report = core.apply(tmp_path, res, groups, set(groups[0][1:]), "trash")
     assert count == 1 and len(trashed) == 1
+    assert report is None and not list(tmp_path.rglob("*.csv"))
     assert not (tmp_path / core.DUP_DIR_NAME).exists()
 
 
