@@ -40,14 +40,14 @@ def download():
         # сертификата — подмену всё равно поймает сверка SHA-256 ниже.
         if "CERTIFICATE_VERIFY_FAILED" not in str(e):
             raise
-        print("сертификат сервера не прошёл проверку, качаю без неё и сверяю SHA-256")
+        print("certificate check failed, downloading without it and verifying SHA-256")
         ctx = ssl._create_unverified_context()
         with urllib.request.urlopen(MODEL_URL, context=ctx) as r, open(tmp, "wb") as f:
             while chunk := r.read(1 << 20):
                 f.write(chunk)
     if sha256(tmp) != MODEL_SHA256:
         tmp.unlink()
-        sys.exit("скачанная модель не совпала по SHA-256 — файл не тот")
+        sys.exit("downloaded model does not match SHA-256")
     tmp.replace(SRC)
 
 
